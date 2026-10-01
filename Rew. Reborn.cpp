@@ -1,3 +1,17 @@
+// ============================================================================
+// Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
+// v0.7.0-alpha: core reescrito con temporización por M-ciclo.
+//   - CPU SM83 con accesos a memoria ciclo a ciclo (timer/PPU/APU/DMA avanzan
+//     en cada acceso), temporización de interrupciones, HALT y halt bug.
+//   - Timer con detección de flanco y recarga retardada de TIMA.
+//   - PPU por puntos (dots), interrupciones STAT por flanco, LY=153 quirk,
+//     OAM DMA real, bug de corrupción de OAM (DMG), HDMA/GDMA.
+//   - CGB: bancos de WRAM (SVBK), VRAM (VBK), paletas, doble velocidad.
+//   - MBC1/MBC2/MBC3(+RTC)/MBC5 con máscaras de banco correctas.
+//   - APU con secuenciador de frames ligado a DIV y comportamiento de hardware.
+// Compilar con -DREW_HEADLESS para usar sólo el núcleo (tests).
+// ============================================================================
+#ifndef REW_HEADLESS
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
 #endif
@@ -5,33 +19,1575 @@
 #include <mmsystem.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include "resource.h"
+#endif
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 #include <array>
 #include <fstream>
 #include <string>
 #include <cstring>
+#include <ctime>
 #include <algorithm>
-#include "resource.h"
+
 const int GB_WIDTH = 160;
 const int GB_HEIGHT = 144;
 uint32_t g_screenBuffer[GB_WIDTH * GB_HEIGHT] = {0};
 bool g_rom_loaded = false;
+
+// 0 = automático (GBC si el cartucho lo soporta), 1 = forzar DMG
+int g_model_pref = 0;
+
+// ============================================================================
+// APU
+// Se avanza en pasos de 2 T-ciclos (2 MHz) sincronizado con la CPU.
+// El secuenciador de frames (512 Hz) lo dispara el flanco de bajada del bit
+// 12 de DIV (bit 13 en doble velocidad), igual que en hardware.
+// ============================================================================
+class APU {
+public:
+    static constexpr int SAMPLE_RATE = 44100;
+    static constexpr int BUF_SAMPLES = 4096;          // pares L/R
+    int16_t sampleBuf[BUF_SAMPLES * 2] = {0};
+    int sampleCount = 0;                               // int16 escritos (L+R)
+
+    bool cgb = false;
+    bool power = true;
+    uint8_t reg[0x17] = {0};                           // FF10..FF26 (valores escritos)
+    uint8_t waveRam[16] = {0};
+
+    struct Pulse {
+        bool on, dac, lenEn, envUp, envDone;
+        int len, freq, timer, pos, duty, vol, envTimer, envPeriod;
+    };
+    struct Wave {
+        bool on, dac, lenEn, justRead;
+        int len, freq, timer, pos, volCode;
+        uint8_t buf;
+    };
+    struct Noise {
+        bool on, dac, lenEn, envUp, envDone;
+        int len, timer, vol, envTimer, envPeriod;
+        uint16_t lfsr;
+    };
+    Pulse sq[2] = {};
+    Wave wv = {};
+    Noise nz = {};
+    bool swEn = false, swNegUsed = false;
+    int swTimer = 0, swShadow = 0;
+    int fsStep = 0;                                    // próximo paso del secuenciador
+
+    // mezcla / remuestreo
+    int64_t accL = 0, accR = 0;
+    int accN = 0;
+    int64_t samplePhase = 0;
+    double capL = 0.0, capR = 0.0;
+
+    static constexpr uint8_t kReadMask[0x17] = {
+        0x80,0x3F,0x00,0xFF,0xBF, 0xFF,0x3F,0x00,0xFF,0xBF,
+        0x7F,0xFF,0x9F,0xFF,0xBF, 0xFF,0xFF,0x00,0x00,0xBF,
+        0x00,0x00,0x70
+    };
+    static constexpr uint8_t kDuty[4][8] = {
+        {0,0,0,0,0,0,0,1},{1,0,0,0,0,0,0,1},{1,0,0,0,0,1,1,1},{0,1,1,1,1,1,1,0}
+    };
+
+    void reset(bool cgbMode) {
+        cgb = cgbMode;
+        power = true;
+        memset(reg, 0, sizeof(reg));
+        sq[0] = Pulse{}; sq[1] = Pulse{}; wv = Wave{}; nz = Noise{};
+        nz.lfsr = 0x7FFF;
+        swEn = swNegUsed = false; swTimer = swShadow = 0;
+        fsStep = 0;
+        accL = accR = 0; accN = 0; samplePhase = 0; capL = capR = 0.0;
+        sampleCount = 0;
+        static const uint8_t wavInit[16] = {0x84,0x40,0x43,0xAA,0x2D,0x78,0x92,0x3C,
+                                            0x60,0x59,0x59,0xB0,0x34,0xB8,0x2E,0xDA};
+        if (cgb) { for (int i = 0; i < 16; ++i) waveRam[i] = (i & 1) ? 0xFF : 0x00; }
+        else memcpy(waveRam, wavInit, 16);
+        // estado tras el boot ROM
+        reg[0x00]=0x80; reg[0x01]=0xBF; reg[0x02]=0xF3; reg[0x03]=0xFF; reg[0x04]=0xBF;
+        reg[0x06]=0x3F; reg[0x07]=0x00; reg[0x08]=0xFF; reg[0x09]=0xBF;
+        reg[0x0A]=0x7F; reg[0x0B]=0xFF; reg[0x0C]=0x9F; reg[0x0D]=0xFF; reg[0x0E]=0xBF;
+        reg[0x10]=0xFF; reg[0x11]=0x00; reg[0x12]=0x00; reg[0x13]=0xBF;
+        reg[0x14]=0x77; reg[0x15]=0xF3;
+        sq[0].duty = 2; sq[0].dac = true; sq[0].on = true; sq[0].vol = 0; sq[0].envDone = true;
+        sq[0].freq = 0x7FF; sq[0].timer = 4;
+        sq[1].freq = 0x7FF; sq[1].timer = 4;
+        wv.freq = 0x7FF; wv.timer = 2;
+        nz.timer = 8;
+    }
+
+    // ----------------------------------------------------------------- helpers
+    int noisePeriod() const {
+        static const int div[8] = {8,16,32,48,64,80,96,112};
+        uint8_t n43 = reg[0x12];
+        return div[n43 & 7] << (n43 >> 4);
+    }
+    int sweepCalc() {
+        uint8_t n10 = reg[0x00];
+        int d = swShadow >> (n10 & 7);
+        int nf;
+        if (n10 & 0x08) { nf = swShadow - d; swNegUsed = true; }
+        else nf = swShadow + d;
+        if (nf > 2047) sq[0].on = false;
+        return nf;
+    }
+    template <class Ch> static void clockLen(Ch& ch) {
+        if (ch.lenEn && ch.len > 0) { if (--ch.len == 0) ch.on = false; }
+    }
+    template <class Ch> static void clockEnv(Ch& ch) {
+        if (--ch.envTimer <= 0) {
+            ch.envTimer = ch.envPeriod ? ch.envPeriod : 8;
+            if (ch.envPeriod && !ch.envDone) {
+                int nv = ch.vol + (ch.envUp ? 1 : -1);
+                if (nv >= 0 && nv <= 15) ch.vol = nv; else ch.envDone = true;
+            }
+        }
+    }
+    void frameSeqClock() {
+        if (!power) return;
+        int step = fsStep;
+        fsStep = (fsStep + 1) & 7;
+        if ((step & 1) == 0) { clockLen(sq[0]); clockLen(sq[1]); clockLen(wv); clockLen(nz); }
+        if (step == 2 || step == 6) {
+            if (--swTimer <= 0) {
+                uint8_t n10 = reg[0x00];
+                int period = (n10 >> 4) & 7;
+                swTimer = period ? period : 8;
+                if (swEn && period) {
+                    int nf = sweepCalc();
+                    if (nf <= 2047 && (n10 & 7)) {
+                        swShadow = nf;
+                        sq[0].freq = nf;
+                        reg[0x03] = nf & 0xFF;
+                        reg[0x04] = (reg[0x04] & 0xF8) | ((nf >> 8) & 7);
+                        sweepCalc();
+                    }
+                }
+            }
+        }
+        if (step == 7) { clockEnv(sq[0]); clockEnv(sq[1]); clockEnv(nz); }
+    }
+
+    // Longitud + trigger comunes a NRx4. Devuelve true si hay trigger.
+    template <class Ch> bool lenTrig(Ch& ch, int maxLen, uint8_t v) {
+        bool was = ch.lenEn;
+        ch.lenEn = (v & 0x40) != 0;
+        bool nextNoLen = (fsStep & 1) != 0;
+        if (nextNoLen && !was && ch.lenEn && ch.len > 0) {
+            if (--ch.len == 0 && !(v & 0x80)) ch.on = false;
+        }
+        if (v & 0x80) {
+            if (ch.len == 0) { ch.len = maxLen; if (ch.lenEn && nextNoLen) ch.len--; }
+            return true;
+        }
+        return false;
+    }
+    template <class Ch> void envTrigger(Ch& ch, uint8_t nrx2) {
+        ch.vol = nrx2 >> 4;
+        ch.envUp = (nrx2 & 0x08) != 0;
+        ch.envPeriod = nrx2 & 7;
+        ch.envTimer = ch.envPeriod ? ch.envPeriod : 8;
+        if (fsStep == 7) ch.envTimer++;
+        ch.envDone = false;
+    }
+
+    void powerOff() {
+        int l0 = sq[0].len, l1 = sq[1].len, l2 = wv.len, l3 = nz.len;
+        for (int i = 0; i < 0x16; ++i) reg[i] = 0;
+        sq[0] = Pulse{}; sq[1] = Pulse{}; wv = Wave{}; nz = Noise{};
+        nz.lfsr = 0x7FFF;
+        swEn = swNegUsed = false; swTimer = swShadow = 0;
+        if (!cgb) { sq[0].len = l0; sq[1].len = l1; wv.len = l2; nz.len = l3; }
+        sq[0].timer = sq[1].timer = 8192; wv.timer = 4096; nz.timer = 8;
+        power = false;
+    }
+    void powerOn() {
+        power = true;
+        fsStep = 0;
+        sq[0].pos = sq[1].pos = 0;
+        wv.buf = 0;
+    }
+
+    // ----------------------------------------------------------------- bus
+    uint8_t read(uint16_t addr) const {
+        if (addr >= 0xFF30) {
+            int i = addr - 0xFF30;
+            if (wv.on) {
+                if (!cgb && !wv.justRead) return 0xFF;
+                return waveRam[wv.pos >> 1];
+            }
+            return waveRam[i];
+        }
+        if (addr == 0xFF26) {
+            return (uint8_t)((power ? 0x80 : 0) | 0x70 | (sq[0].on ? 1 : 0) | (sq[1].on ? 2 : 0) |
+                             (wv.on ? 4 : 0) | (nz.on ? 8 : 0));
+        }
+        int i = addr - 0xFF10;
+        if (i < 0 || i >= 0x17) return 0xFF;
+        return reg[i] | kReadMask[i];
+    }
+
+    void write(uint16_t addr, uint8_t v) {
+        if (addr >= 0xFF30) {
+            int i = addr - 0xFF30;
+            if (wv.on) {
+                if (!cgb && !wv.justRead) return;
+                waveRam[wv.pos >> 1] = v;
+                return;
+            }
+            waveRam[i] = v;
+            return;
+        }
+        if (addr == 0xFF26) {
+            bool np = (v & 0x80) != 0;
+            if (!np && power) powerOff();
+            else if (np && !power) powerOn();
+            return;
+        }
+        int i = addr - 0xFF10;
+        if (i < 0 || i >= 0x16) return;
+        if (!power) {
+            if (!cgb) {
+                if (addr == 0xFF11) sq[0].len = 64 - (v & 63);
+                else if (addr == 0xFF16) sq[1].len = 64 - (v & 63);
+                else if (addr == 0xFF1B) wv.len = 256 - v;
+                else if (addr == 0xFF20) nz.len = 64 - (v & 63);
+            }
+            return;
+        }
+        uint8_t old = reg[i];
+        reg[i] = v;
+        switch (addr) {
+            case 0xFF10:
+                if (swNegUsed && (old & 0x08) && !(v & 0x08)) sq[0].on = false;
+                break;
+            case 0xFF11: case 0xFF16: {
+                Pulse& p = sq[addr == 0xFF11 ? 0 : 1];
+                p.duty = v >> 6; p.len = 64 - (v & 63);
+                break;
+            }
+            case 0xFF12: case 0xFF17: {
+                Pulse& p = sq[addr == 0xFF12 ? 0 : 1];
+                p.dac = (v & 0xF8) != 0;
+                if (!p.dac) p.on = false;
+                break;
+            }
+            case 0xFF13: case 0xFF18: {
+                Pulse& p = sq[addr == 0xFF13 ? 0 : 1];
+                p.freq = (p.freq & 0x700) | v;
+                break;
+            }
+            case 0xFF14: case 0xFF19: {
+                int k = addr == 0xFF14 ? 0 : 1;
+                Pulse& p = sq[k];
+                p.freq = (p.freq & 0xFF) | ((v & 7) << 8);
+                if (lenTrig(p, 64, v)) {
+                    p.on = true;
+                    p.timer = (2048 - p.freq) * 4 + 8;
+                    envTrigger(p, reg[k == 0 ? 0x02 : 0x07]);
+                    if (k == 0) {
+                        uint8_t n10 = reg[0x00];
+                        int period = (n10 >> 4) & 7, shift = n10 & 7;
+                        swShadow = p.freq;
+                        swTimer = period ? period : 8;
+                        swEn = period || shift;
+                        swNegUsed = false;
+                        if (shift) sweepCalc();
+                    }
+                    if (!p.dac) p.on = false;
+                }
+                break;
+            }
+            case 0xFF1A:
+                wv.dac = (v & 0x80) != 0;
+                if (!wv.dac) wv.on = false;
+                break;
+            case 0xFF1B: wv.len = 256 - v; break;
+            case 0xFF1C: wv.volCode = (v >> 5) & 3; break;
+            case 0xFF1D: wv.freq = (wv.freq & 0x700) | v; break;
+            case 0xFF1E: {
+                wv.freq = (wv.freq & 0xFF) | ((v & 7) << 8);
+                if (lenTrig(wv, 256, v)) {
+                    // DMG: re-disparar justo cuando el canal lee RAM de onda la corrompe
+                    if (!cgb && wv.on && wv.timer <= 2) {
+                        int off = ((wv.pos + 1) >> 1) & 0xF;
+                        if (off < 4) waveRam[0] = waveRam[off];
+                        else memcpy(waveRam, waveRam + (off & ~3), 4);
+                    }
+                    wv.on = true;
+                    wv.pos = 0;
+                    wv.timer = (2048 - wv.freq) * 2 + 6;
+                    if (!wv.dac) wv.on = false;
+                }
+                break;
+            }
+            case 0xFF20: nz.len = 64 - (v & 63); break;
+            case 0xFF21:
+                nz.dac = (v & 0xF8) != 0;
+                if (!nz.dac) nz.on = false;
+                break;
+            case 0xFF23:
+                if (lenTrig(nz, 64, v)) {
+                    nz.on = true;
+                    nz.lfsr = 0x7FFF;
+                    nz.timer = noisePeriod() + 8;
+                    envTrigger(nz, reg[0x11]);
+                    if (!nz.dac) nz.on = false;
+                }
+                break;
+            default: break;
+        }
+    }
+
+    // ----------------------------------------------------------------- output
+    int pulseOut(int k) const {
+        const Pulse& p = sq[k];
+        return (p.on && kDuty[p.duty][p.pos]) ? p.vol : 0;
+    }
+    int waveOut() const {
+        if (!wv.on || wv.volCode == 0) return 0;
+        uint8_t s = (wv.pos & 1) ? (wv.buf & 0x0F) : (wv.buf >> 4);
+        return s >> (wv.volCode - 1);
+    }
+    int noiseOut() const { return (nz.on && !(nz.lfsr & 1)) ? nz.vol : 0; }
+    uint8_t pcm12() const { return (uint8_t)((pulseOut(1) << 4) | pulseOut(0)); }
+    uint8_t pcm34() const { return (uint8_t)((noiseOut() << 4) | waveOut()); }
+
+    void tick2() {
+        wv.justRead = false;
+        if (!power) { accN++; return; }
+        for (int k = 0; k < 2; ++k) {
+            Pulse& p = sq[k];
+            if (!p.on) continue;
+            p.timer -= 2;
+            if (p.timer <= 0) { p.timer += (2048 - p.freq) * 4; p.pos = (p.pos + 1) & 7; }
+        }
+        if (wv.on) {
+            wv.timer -= 2;
+            if (wv.timer <= 0) {
+                wv.timer += (2048 - wv.freq) * 2;
+                wv.pos = (wv.pos + 1) & 31;
+                wv.buf = waveRam[wv.pos >> 1];
+                wv.justRead = true;
+            }
+        }
+        if (nz.on) {
+            nz.timer -= 2;
+            while (nz.timer <= 0) {
+                nz.timer += noisePeriod();
+                if ((reg[0x12] >> 4) < 14) {
+                    uint16_t x = (nz.lfsr ^ (nz.lfsr >> 1)) & 1;
+                    nz.lfsr = (uint16_t)((nz.lfsr >> 1) | (x << 14));
+                    if (reg[0x12] & 0x08) nz.lfsr = (uint16_t)((nz.lfsr & ~0x40) | (x << 6));
+                }
+            }
+        }
+        int ch[4] = {
+            sq[0].dac ? pulseOut(0) * 2 - 15 : 0,
+            sq[1].dac ? pulseOut(1) * 2 - 15 : 0,
+            wv.dac    ? waveOut() * 2 - 15   : 0,
+            nz.dac    ? noiseOut() * 2 - 15  : 0
+        };
+        uint8_t n51 = reg[0x15], n50 = reg[0x14];
+        int l = 0, r = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (n51 & (0x10 << i)) l += ch[i];
+            if (n51 & (0x01 << i)) r += ch[i];
+        }
+        accL += l * (((n50 >> 4) & 7) + 1);
+        accR += r * ((n50 & 7) + 1);
+        accN++;
+    }
+
+    void emitSample() {
+        double l = 0, r = 0;
+        if (accN > 0) { l = (double)accL / accN * 64.0; r = (double)accR / accN * 64.0; }
+        accL = accR = 0; accN = 0;
+        double ol = l - capL; capL = l - ol * 0.996;
+        double orr = r - capR; capR = r - orr * 0.996;
+        auto clip = [](double v) -> int16_t {
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            return (int16_t)v;
+        };
+        if (sampleCount + 2 <= BUF_SAMPLES * 2) {
+            sampleBuf[sampleCount++] = clip(ol);
+            sampleBuf[sampleCount++] = clip(orr);
+        }
+    }
+
+    // dots = T-ciclos a velocidad normal (tiempo real); siempre par.
+    void run(int dots) {
+        for (int t = 0; t < dots; t += 2) {
+            tick2();
+            samplePhase += 2LL * SAMPLE_RATE;
+            if (samplePhase >= 4194304) { samplePhase -= 4194304; emitSample(); }
+        }
+    }
+};
+constexpr uint8_t APU::kReadMask[0x17];
+constexpr uint8_t APU::kDuty[4][8];
+
+// ============================================================================
+// Bus: cartucho, memoria, timer, PPU, DMA y CPU
+// ============================================================================
+class Bus {
+public:
+    static constexpr uint32_t kStateMagic = 0x52455742; // "REWB"
+    static constexpr uint32_t kStateVersion = 8;
+
+    // ------------------------------------------------------------ cartucho
+    std::vector<uint8_t> rom;
+    std::array<uint8_t, 0x20000> ext_ram{};
+    bool mbc1Multicart = false;
+    uint8_t mbcType = 0;            // 0 nada, 1 MBC1, 2 MBC2, 3 MBC3, 5 MBC5
+    bool hasRtc = false, hasBattery = false;
+    uint32_t ramSize = 0;
+    uint16_t romBank = 1;
+    uint8_t ramBank = 0;
+    bool ramEnabled = false;
+    uint8_t mbcMode = 0;
+    uint8_t rtcRegs[5] = {0}, rtcLatched[5] = {0};
+    uint8_t rtcLatchPrev = 0xFF;
+    uint32_t rtcSubDots = 0;
+
+    // ------------------------------------------------------------ memoria
+    std::array<uint8_t, 0x2000> vram{}, vram1{};
+    std::array<uint8_t, 0x8000> wram{};
+    std::array<uint8_t, 0xA0> oam{};
+    std::array<uint8_t, 0x7F> hram{};
+    uint8_t ie = 0, iflag = 0xE1;
+
+    // ------------------------------------------------------------ CGB
+    bool isCgbMode = false;
+    uint8_t vbk = 0, svbk = 0, key1Armed = 0, opri = 0;
+    uint8_t ff72 = 0, ff73 = 0, ff74 = 0, ff75 = 0;
+    bool cgbDoubleSpeed = false;
+    std::array<uint8_t, 64> bgPaletteRam{}, objPaletteRam{};
+    uint8_t bcps = 0, ocps = 0;
+    uint16_t hdmaSrc = 0, hdmaDst = 0;
+    uint8_t hdmaBlocksLeft = 0;
+    bool hdmaActive = false;
+    uint8_t hdmaStatus = 0xFF;
+    int stallDots = 0;
+
+    // ------------------------------------------------------------ OAM DMA
+    bool dmaActive = false;
+    uint8_t dmaIndex = 0, dmaReg = 0xFF;
+    uint16_t dmaSrc = 0, dmaPendingSrc = 0;
+    int dmaStartDelay = 0;
+
+    // ------------------------------------------------------------ timer
+    uint16_t divCounter = 0;
+    uint8_t tima = 0, tma = 0, tac = 0xF8;
+    uint8_t timaState = 0;          // 1 = TIMA desbordó (lee 0), 2 = ciclo de recarga
+    static constexpr int kClockSelectBit[4] = {9, 3, 5, 7};
+
+    // ------------------------------------------------------------ serie
+    uint8_t sb = 0, sc = 0x7E;
+    int serialCycles = 0;
+    std::string serialOut;
+
+    // ------------------------------------------------------------ joypad
+    uint8_t joypSelect = 0x30, buttonsState = 0xFF;
+    static constexpr uint8_t kButtonBit[8] = { 2, 3, 1, 0, 4, 5, 6, 7 };
+
+    // ------------------------------------------------------------ PPU
+    uint8_t lcdc = 0x91, stat = 0x80, scy = 0, scx = 0, ly = 0, lyReg = 0, lyc = 0;
+    uint8_t wy = 0, wx = 0, bgp = 0xFC, obp0 = 0xFF, obp1 = 0xFF;
+    int lineDot = 0, mode3End = 252;
+    uint8_t ppuMode = 0;
+    bool statLine = false, lcdFirstLine = false, wyTriggered = false;
+    int windowInternalLine = 0;
+    uint32_t frameBuf[GB_WIDTH * GB_HEIGHT] = {0};
+    bool frameReady = false;
+
+    // ------------------------------------------------------------ CPU
+    uint16_t pc = 0x100, sp = 0xFFFE;
+    uint8_t a = 0, f = 0, b = 0, c = 0, d = 0, e = 0, h = 0, l = 0;
+    bool ime = false, imeEnablePending = false, halted = false, haltBugPending = false;
+    int64_t frameDots = 0;
+
+    APU apu;
+
+    // Desfase de la fila de OAM que el PPU lee en modo 2 (corrupción DMG)
+    int oamBugRowOffset = 0;
+    int lcdOnStartDot = 4;
+    uint8_t statModeSnap = 0;
+
+    // ================================================================ util
+    int dotsPerM() const { return cgbDoubleSpeed ? 2 : 4; }
+    void requestInterrupt(uint8_t m) { iflag |= m; }
+
+    static uint32_t rgb555ToArgb(uint16_t col) {
+        uint8_t r = col & 0x1F, g = (col >> 5) & 0x1F, bb = (col >> 10) & 0x1F;
+        auto ex = [](uint8_t v) { return (uint8_t)((v << 3) | (v >> 2)); };
+        return ((uint32_t)ex(r) << 16) | ((uint32_t)ex(g) << 8) | (uint32_t)ex(bb);
+    }
+    static uint32_t dmgShade(uint8_t i) {
+        static const uint32_t t[4] = {0x00E0F8D0, 0x0088C070, 0x00346856, 0x00081820};
+        return t[i & 3];
+    }
+
+    // ================================================================ carga
+    bool loadRom(const std::string& path) {
+        std::ifstream fi(path, std::ios::binary);
+        if (!fi) return false;
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(fi)), std::istreambuf_iterator<char>());
+        if (data.size() < 0x150) return false;
+        size_t sz = 0x8000;
+        while (sz < data.size()) sz <<= 1;
+        data.resize(sz, 0xFF);
+        rom = std::move(data);
+
+        uint8_t type = rom[0x147];
+        hasRtc = false; hasBattery = false;
+        switch (type) {
+            case 0x01: case 0x02: case 0x03: mbcType = 1; break;
+            case 0x05: case 0x06: mbcType = 2; break;
+            case 0x0F: case 0x10: mbcType = 3; hasRtc = true; break;
+            case 0x11: case 0x12: case 0x13: mbcType = 3; break;
+            case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E: mbcType = 5; break;
+            default: mbcType = 0; break;
+        }
+        switch (type) {
+            case 0x03: case 0x06: case 0x09: case 0x0D: case 0x0F: case 0x10:
+            case 0x13: case 0x1B: case 0x1E: hasBattery = true; break;
+            default: break;
+        }
+        static const uint32_t kRamSizes[6] = {0, 0x800, 0x2000, 0x8000, 0x20000, 0x10000};
+        uint8_t rs = rom[0x149];
+        ramSize = rs < 6 ? kRamSizes[rs] : 0;
+        if (mbcType == 2) ramSize = 0x200;
+        if (type == 0x10 || type == 0x13 || type == 0x12) { if (ramSize == 0) ramSize = 0x8000; }
+
+        mbc1Multicart = mbcType == 1 && rom.size() == 0x100000 &&
+                        std::equal(rom.begin() + 0x104, rom.begin() + 0x134, rom.begin() + 0x40104);
+        isCgbMode = (rom[0x143] & 0x80) != 0 && g_model_pref != 1;
+        ext_ram.fill(0xFF);
+        reset();
+        return true;
+    }
+
+    void reset() {
+        if (isCgbMode) { a = 0x11; f = 0x80; b = 0x00; c = 0x00; d = 0xFF; e = 0x56; h = 0x00; l = 0x0D; }
+        else { a = 0x01; f = 0xB0; b = 0x00; c = 0x13; d = 0x00; e = 0xD8; h = 0x01; l = 0x4D; }
+        pc = 0x100; sp = 0xFFFE;
+        ime = imeEnablePending = halted = haltBugPending = false;
+        divCounter = isCgbMode ? 0x1EA0 : 0xABCC;
+        tima = 0; tma = 0; tac = 0xF8; timaState = 0;
+        romBank = 1; ramBank = 0; ramEnabled = (mbcType == 0); mbcMode = 0;
+        rtcLatchPrev = 0xFF; rtcSubDots = 0;
+        dmaActive = false; dmaIndex = 0; dmaReg = 0xFF; dmaSrc = 0; dmaPendingSrc = 0; dmaStartDelay = 0;
+        joypSelect = 0x30; buttonsState = 0xFF;
+        sb = 0; sc = 0x7E; serialCycles = 0; serialOut.clear();
+        vram.fill(0); vram1.fill(0); wram.fill(0); oam.fill(0); hram.fill(0);
+        ie = 0; iflag = 0xE1;
+        lcdc = 0x91; stat = 0x80; scy = scx = 0; lyc = 0; wy = wx = 0;
+        bgp = 0xFC; obp0 = obp1 = 0xFF;
+        ly = 0; lyReg = 0; lineDot = 0; ppuMode = 0; statLine = false;
+        lcdFirstLine = false; wyTriggered = false; windowInternalLine = 0; mode3End = 252;
+        frameReady = false; frameDots = 0;
+        vbk = 0; svbk = 0; key1Armed = 0; opri = 0; ff72 = ff73 = ff74 = 0; ff75 = 0;
+        cgbDoubleSpeed = false; bcps = ocps = 0;
+        for (int i = 0; i < 64; i += 2) {
+            bgPaletteRam[i] = 0xFF; bgPaletteRam[i + 1] = 0x7F;
+            objPaletteRam[i] = 0xFF; objPaletteRam[i + 1] = 0x7F;
+        }
+        hdmaSrc = hdmaDst = 0; hdmaBlocksLeft = 0; hdmaActive = false; hdmaStatus = 0xFF; stallDots = 0;
+        apu.reset(isCgbMode);
+        for (auto& px : frameBuf) px = isCgbMode ? 0x00FFFFFF : dmgShade(0);
+    }
+
+    // ================================================================ MBC
+    int mbc1HighShift() const { return mbc1Multicart ? 4 : 5; }
+    uint8_t romRead(uint16_t addr) const {
+        size_t banks = rom.size() / 0x4000;
+        size_t bank;
+        if (addr < 0x4000) {
+            bank = (mbcType == 1 && mbcMode) ? (size_t)((ramBank & 3) << mbc1HighShift()) : 0;
+        } else {
+            switch (mbcType) {
+                case 1: bank = (size_t)(((ramBank & 3) << mbc1HighShift()) | (romBank & (mbc1Multicart ? 0x0F : 0x1F))); break;
+                case 0: bank = 1; break;
+                default: bank = romBank; break;
+            }
+        }
+        bank %= banks;
+        return rom[bank * 0x4000 + (addr & 0x3FFF)];
+    }
+
+    void mbcWrite(uint16_t addr, uint8_t v) {
+        switch (mbcType) {
+            case 1:
+                if (addr < 0x2000) ramEnabled = (v & 0x0F) == 0x0A;
+                else if (addr < 0x4000) { romBank = v & 0x1F; if (romBank == 0) romBank = 1; }
+                else if (addr < 0x6000) ramBank = v & 3;
+                else mbcMode = v & 1;
+                break;
+            case 2:
+                if (addr < 0x4000) {
+                    if (addr & 0x100) { romBank = v & 0x0F; if (romBank == 0) romBank = 1; }
+                    else ramEnabled = (v & 0x0F) == 0x0A;
+                }
+                break;
+            case 3:
+                if (addr < 0x2000) ramEnabled = (v & 0x0F) == 0x0A;
+                else if (addr < 0x4000) {
+                    romBank = (rom.size() > 0x200000) ? v : (v & 0x7F);
+                    if (romBank == 0) romBank = 1;
+                }
+                else if (addr < 0x6000) ramBank = v & 0x0F;
+                else {
+                    if (rtcLatchPrev == 0x00 && v == 0x01) memcpy(rtcLatched, rtcRegs, 5);
+                    rtcLatchPrev = v;
+                }
+                break;
+            case 5:
+                if (addr < 0x2000) ramEnabled = (v & 0x0F) == 0x0A;
+                else if (addr < 0x3000) romBank = (romBank & 0x100) | v;
+                else if (addr < 0x4000) romBank = (romBank & 0xFF) | ((v & 1) << 8);
+                else if (addr < 0x6000) ramBank = v & 0x0F;
+                break;
+            default: break;
+        }
+    }
+
+    uint32_t cartRamOffset(uint16_t addr) const {
+        uint32_t bank = (mbcType == 1 && mbcMode == 0) ? 0 : ramBank;
+        return (bank * 0x2000 + (addr & 0x1FFF)) % ramSize;
+    }
+
+    uint8_t cartRamRead(uint16_t addr) const {
+        if (!ramEnabled) return 0xFF;
+        if (mbcType == 2) return ext_ram[addr & 0x1FF] | 0xF0;
+        if (mbcType == 3 && ramBank >= 0x08) {
+            if (!hasRtc || ramBank > 0x0C) return 0xFF;
+            static const uint8_t m[5] = {0x3F, 0x3F, 0x1F, 0xFF, 0xC1};
+            int i = ramBank - 8;
+            return (rtcLatched[i] & m[i]) | (uint8_t)~m[i];
+        }
+        if (ramSize == 0) return 0xFF;
+        return ext_ram[cartRamOffset(addr)];
+    }
+
+    void cartRamWrite(uint16_t addr, uint8_t v) {
+        if (!ramEnabled) return;
+        if (mbcType == 2) { ext_ram[addr & 0x1FF] = v & 0x0F; return; }
+        if (mbcType == 3 && ramBank >= 0x08) {
+            if (!hasRtc || ramBank > 0x0C) return;
+            static const uint8_t m[5] = {0x3F, 0x3F, 0x1F, 0xFF, 0xC1};
+            int i = ramBank - 8;
+            rtcRegs[i] = v & m[i];
+            rtcLatched[i] = v & m[i];
+            if (i == 0) rtcSubDots = 0;
+            return;
+        }
+        if (ramSize == 0) return;
+        ext_ram[cartRamOffset(addr)] = v;
+    }
+
+    // ================================================================ RTC
+    void rtcIncSecond() {
+        uint8_t& s = rtcRegs[0]; uint8_t& m = rtcRegs[1]; uint8_t& hr = rtcRegs[2];
+        s = (s + 1) & 0x3F;
+        if (s != 60) return;
+        s = 0; m = (m + 1) & 0x3F;
+        if (m != 60) return;
+        m = 0; hr = (hr + 1) & 0x1F;
+        if (hr != 24) return;
+        hr = 0;
+        uint16_t day = (uint16_t)(rtcRegs[3] | ((rtcRegs[4] & 1) << 8));
+        day++;
+        if (day > 511) { day = 0; rtcRegs[4] |= 0x80; }
+        rtcRegs[3] = day & 0xFF;
+        rtcRegs[4] = (rtcRegs[4] & 0xFE) | ((day >> 8) & 1);
+    }
+    void rtcAdvanceSeconds(uint64_t secs) {
+        if (!hasRtc || (rtcRegs[4] & 0x40) || secs == 0) return;
+        if (rtcRegs[0] < 60 && rtcRegs[1] < 60 && rtcRegs[2] < 24) {
+            uint64_t day = rtcRegs[3] | ((rtcRegs[4] & 1) << 8);
+            uint64_t total = rtcRegs[0] + rtcRegs[1] * 60ULL + rtcRegs[2] * 3600ULL + day * 86400ULL + secs;
+            rtcRegs[0] = total % 60; total /= 60;
+            rtcRegs[1] = total % 60; total /= 60;
+            rtcRegs[2] = total % 24; total /= 24;
+            if (total > 511) rtcRegs[4] |= 0x80;
+            total %= 512;
+            rtcRegs[3] = total & 0xFF;
+            rtcRegs[4] = (rtcRegs[4] & 0xFE) | ((total >> 8) & 1);
+        } else {
+            if (secs > 100000) secs = 100000;
+            while (secs--) rtcIncSecond();
+        }
+    }
+    void rtcTick(int dots) {
+        if (!hasRtc || (rtcRegs[4] & 0x40)) return;
+        rtcSubDots += dots;
+        while (rtcSubDots >= 4194304) { rtcSubDots -= 4194304; rtcIncSecond(); }
+    }
+
+    // Formato .sav: RAM + (si hay RTC) bloque de 48 bytes compatible con BGB/VBA
+    std::vector<uint8_t> batteryData() const {
+        std::vector<uint8_t> out(ext_ram.begin(), ext_ram.begin() + ramSize);
+        if (hasRtc) {
+            auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) out.push_back((v >> (8 * i)) & 0xFF); };
+            for (int i = 0; i < 5; ++i) put32(rtcRegs[i]);
+            for (int i = 0; i < 5; ++i) put32(rtcLatched[i]);
+            uint64_t t = (uint64_t)time(nullptr);
+            for (int i = 0; i < 8; ++i) out.push_back((t >> (8 * i)) & 0xFF);
+        }
+        return out;
+    }
+    void loadBatteryData(const std::vector<uint8_t>& in) {
+        size_t n = std::min<size_t>(in.size(), ramSize);
+        if (n) memcpy(ext_ram.data(), in.data(), n);
+        if (hasRtc && in.size() >= (size_t)ramSize + 44) {
+            const uint8_t* p = in.data() + ramSize;
+            auto get32 = [&](int i) { return (uint32_t)p[i] | ((uint32_t)p[i + 1] << 8) | ((uint32_t)p[i + 2] << 16) | ((uint32_t)p[i + 3] << 24); };
+            for (int i = 0; i < 5; ++i) rtcRegs[i] = (uint8_t)get32(i * 4);
+            for (int i = 0; i < 5; ++i) rtcLatched[i] = (uint8_t)get32(20 + i * 4);
+            uint64_t saved = get32(40);
+            if (in.size() >= (size_t)ramSize + 48) saved |= (uint64_t)get32(44) << 32;
+            uint64_t now = (uint64_t)time(nullptr);
+            if (saved && now > saved) rtcAdvanceSeconds(now - saved);
+        }
+    }
+
+    // ================================================================ joypad
+    uint8_t readJoyp() const {
+        uint8_t r = (joypSelect & 0x30) | 0xC0;
+        uint8_t ln = 0x0F;
+        if (!(joypSelect & 0x10)) ln &= (buttonsState & 0x0F);
+        if (!(joypSelect & 0x20)) ln &= ((buttonsState >> 4) & 0x0F);
+        return r | ln;
+    }
+    void setButton(int idx, bool p) {
+        if (idx < 0 || idx > 7) return;
+        uint8_t bit = kButtonBit[idx];
+        bool wasReleased = ((buttonsState >> bit) & 1) != 0;
+        if (p) buttonsState &= ~(1u << bit); else buttonsState |= (1u << bit);
+        if (p && wasReleased) requestInterrupt(0x10);
+    }
+    void releaseAllButtons() { buttonsState = 0xFF; }
+
+    // ================================================================ timer
+    bool timerSignal() const {
+        return (tac & 0x04) && ((divCounter >> kClockSelectBit[tac & 3]) & 1);
+    }
+    void incTima() {
+        if (tima == 0xFF) { tima = 0; timaState = 1; }
+        else tima++;
+    }
+    void timerTickM() {
+        if (timaState == 1) { tima = tma; iflag |= 0x04; timaState = 2; }
+        else if (timaState == 2) timaState = 0;
+        bool oldSig = timerSignal();
+        uint16_t oldDiv = divCounter;
+        divCounter = (uint16_t)(divCounter + 4);
+        if (oldSig && !timerSignal()) incTima();
+        int ab = cgbDoubleSpeed ? 13 : 12;
+        if (((oldDiv >> ab) & 1) && !((divCounter >> ab) & 1)) apu.frameSeqClock();
+    }
+    void writeDiv() {
+        bool oldSig = timerSignal();
+        int ab = cgbDoubleSpeed ? 13 : 12;
+        bool apuBit = (divCounter >> ab) & 1;
+        divCounter = 0;
+        if (oldSig) incTima();
+        if (apuBit) apu.frameSeqClock();
+    }
+    void writeTac(uint8_t v) {
+        bool oldSig = timerSignal();
+        tac = v | 0xF8;
+        if (oldSig && !timerSignal()) incTima();
+    }
+
+    // ================================================================ OAM DMA
+    uint8_t dmaRead(uint16_t addr) const {
+        if (addr >= 0xE000) addr -= 0x2000;
+        if (addr < 0x8000) return romRead(addr);
+        if (addr < 0xA000) return (isCgbMode && vbk) ? vram1[addr - 0x8000] : vram[addr - 0x8000];
+        if (addr < 0xC000) return cartRamRead(addr);
+        return wramRead(addr);
+    }
+    // Escritura en el ciclo M, ciclo M+1 de preparación, bytes en M+2..M+161.
+    // La OAM queda bloqueada mientras dura la copia (y durante un reinicio).
+    void dmaTickM() {
+        if (dmaStartDelay > 0 && --dmaStartDelay == 0) {
+            dmaActive = true; dmaIndex = 0; dmaSrc = dmaPendingSrc;
+        }
+        if (dmaActive) {
+            if (dmaIndex >= 160) dmaActive = false;
+            else { oam[dmaIndex] = dmaRead((uint16_t)(dmaSrc + dmaIndex)); ++dmaIndex; }
+        }
+    }
+
+    // ================================================================ WRAM
+    int wramBankIndex() const {
+        if (!isCgbMode) return 1;
+        int bk = svbk & 7;
+        return bk ? bk : 1;
+    }
+    uint8_t wramRead(uint16_t addr) const {
+        addr &= 0x1FFF;
+        if (addr < 0x1000) return wram[addr];
+        return wram[wramBankIndex() * 0x1000 + (addr & 0x0FFF)];
+    }
+    void wramWrite(uint16_t addr, uint8_t v) {
+        addr &= 0x1FFF;
+        if (addr < 0x1000) wram[addr] = v;
+        else wram[wramBankIndex() * 0x1000 + (addr & 0x0FFF)] = v;
+    }
+
+    // ================================================================ HDMA
+    uint8_t hdmaReadSrc(uint16_t addr) const {
+        if (addr < 0x8000) return romRead(addr);
+        if (addr < 0xA000) return 0xFF;
+        if (addr < 0xC000) return cartRamRead(addr);
+        if (addr < 0xE000) return wramRead(addr);
+        return cartRamRead((uint16_t)(addr - 0x4000));
+    }
+    void hdmaCopyBlock() {
+        auto& bank = vbk ? vram1 : vram;
+        for (int i = 0; i < 16; ++i) {
+            bank[(hdmaDst + i) & 0x1FFF] = hdmaReadSrc((uint16_t)(hdmaSrc + i));
+        }
+        hdmaSrc = (uint16_t)(hdmaSrc + 16);
+        hdmaDst = (uint16_t)((hdmaDst + 16) & 0x1FF0);
+        stallDots += 32;
+        if (--hdmaBlocksLeft == 0) { hdmaActive = false; hdmaStatus = 0xFF; }
+    }
+    void writeHdma5(uint8_t v) {
+        if (hdmaActive) {
+            if (!(v & 0x80)) {
+                hdmaActive = false;
+                hdmaStatus = 0x80 | ((hdmaBlocksLeft - 1) & 0x7F);
+            }
+            return;
+        }
+        hdmaBlocksLeft = (v & 0x7F) + 1;
+        if (v & 0x80) {
+            hdmaActive = true;
+            hdmaStatus = 0;
+            if (!(lcdc & 0x80) || (ppuMode == 0 && ly < 144)) hdmaCopyBlock();
+        } else {
+            while (hdmaBlocksLeft) {
+                auto& bank = vbk ? vram1 : vram;
+                for (int i = 0; i < 16; ++i) bank[(hdmaDst + i) & 0x1FFF] = hdmaReadSrc((uint16_t)(hdmaSrc + i));
+                hdmaSrc = (uint16_t)(hdmaSrc + 16);
+                hdmaDst = (uint16_t)((hdmaDst + 16) & 0x1FF0);
+                hdmaBlocksLeft--;
+                stallDots += 32;
+            }
+            hdmaStatus = 0xFF;
+        }
+    }
+
+    // ================================================================ PPU
+    // La CPU ve el modo PPU del inicio de su ciclo M.
+    bool vramBlocked() const { return (lcdc & 0x80) && statModeSnap == 3; }
+    bool oamBlocked() const { return (lcdc & 0x80) && (statModeSnap == 2 || statModeSnap == 3); }
+
+    // Penalización de modo 3 por objetos: 6 dots por objeto visible, más hasta 5 dots
+    // para el primer objeto de cada columna de 8 píxeles (alineada con SCX).
+    int spritePenalty() const {
+        int idx[10];
+        int n = spritesOnLine(ly, idx);
+        bool seen[32] = {false};
+        int pen = 0;
+        for (int k = 0; k < n; ++k) {
+            int x = oam[idx[k] * 4 + 1];
+            if (x >= 168) continue;
+            pen += 6;
+            int shifted = x + (scx & 7);
+            int col = shifted >> 3;
+            if (x == 0) { if (!seen[0]) pen += 5; seen[0] = true; continue; }
+            if (seen[col]) continue;
+            seen[col] = true;
+            pen += std::max(0, 5 - (shifted & 7));
+        }
+        return pen;
+    }
+
+    uint8_t vramBankRead(int bank, uint16_t off) const { return bank ? vram1[off] : vram[off]; }
+
+    int spritesOnLine(int line, int* outIdx) const {
+        int hgt = (lcdc & 0x04) ? 16 : 8;
+        int n = 0;
+        for (int i = 0; i < 40 && n < 10; ++i) {
+            int sy = oam[i * 4] - 16;
+            if (line >= sy && line < sy + hgt) { if (outIdx) outIdx[n] = i; n++; }
+        }
+        return n;
+    }
+
+    void updateStat() {
+        bool coinc = (lyReg == lyc);
+        stat = (uint8_t)((stat & 0xF8) | (coinc ? 0x04 : 0) | ppuMode);
+        bool line = false;
+        if (lcdc & 0x80) {
+            line = ((stat & 0x40) && coinc) ||
+                   (ppuMode == 0 && (stat & 0x08)) ||
+                   (ppuMode == 1 && (stat & 0x10)) ||
+                   (ppuMode == 2 && (stat & 0x20)) ||
+                   (ly == 144 && lineDot == 0 && (stat & 0x20));
+        }
+        if (line && !statLine) iflag |= 0x02;
+        statLine = line;
+    }
+
+    void ppuDot() {
+        if (!(lcdc & 0x80)) return;
+        if (lineDot == 0) {
+            if (ly == 0) { windowInternalLine = 0; wyTriggered = false; }
+            if (ly < 144) {
+                ppuMode = lcdFirstLine ? 0 : 2;
+                if (ly == wy) wyTriggered = true;
+            } else if (ly == 144) {
+                ppuMode = 1;
+                iflag |= 0x01;
+                memcpy(g_screenBuffer, frameBuf, sizeof(frameBuf));
+                frameReady = true;
+            }
+        }
+        if (ly < 144) {
+            if (lineDot == 80) {
+                ppuMode = 3;
+                lcdFirstLine = false;
+                int len = 172 + (scx & 7) + ((lcdc & 0x02) || isCgbMode ? spritePenalty() : 0);
+                if (wyTriggered && (lcdc & 0x20) && wx <= 166) len += 6;
+                if (len > 289) len = 289;
+                mode3End = 80 + len;
+            } else if (lineDot == mode3End && ppuMode == 3) {
+                renderScanline();
+                ppuMode = 0;
+                if (hdmaActive) hdmaCopyBlock();
+            }
+        }
+        if (ly == 153 && lineDot == 4) lyReg = 0;
+        updateStat();
+        if (++lineDot >= 456) {
+            lineDot = 0;
+            ly = (ly >= 153) ? 0 : (uint8_t)(ly + 1);
+            lyReg = ly;
+        }
+    }
+
+    void writeLcdc(uint8_t v) {
+        bool wasOn = (lcdc & 0x80) != 0;
+        lcdc = v;
+        bool on = (v & 0x80) != 0;
+        if (wasOn && !on) {
+            ly = 0; lyReg = 0; lineDot = 0; ppuMode = 0; statLine = false;
+            stat &= 0xFC;
+        } else if (!wasOn && on) {
+            ly = 0; lyReg = 0; lineDot = lcdOnStartDot; ppuMode = 0;
+            lcdFirstLine = true; wyTriggered = (wy == 0); windowInternalLine = 0;
+            updateStat();
+        }
+    }
+
+    void renderScanline() {
+        uint8_t bgIdx[GB_WIDTH];
+        uint8_t bgAttrPrio[GB_WIDTH];
+        uint32_t* row = &frameBuf[ly * GB_WIDTH];
+        bool cgb = isCgbMode;
+        bool bgOn = cgb || (lcdc & 0x01);
+        bool winOn = (lcdc & 0x20) && wyTriggered && wx <= 166 && (cgb || (lcdc & 0x01));
+        bool winUsed = false;
+        int winX = (int)wx - 7;
+        for (int x = 0; x < GB_WIDTH; ++x) {
+            bgIdx[x] = 0; bgAttrPrio[x] = 0;
+            if (!bgOn) { row[x] = dmgShade(bgp & 3); continue; }
+            bool inWin = winOn && x >= winX;
+            int px, py; uint16_t mapBase;
+            if (inWin) {
+                winUsed = true;
+                px = x - winX; py = windowInternalLine;
+                mapBase = (lcdc & 0x40) ? 0x1C00 : 0x1800;
+            } else {
+                px = (x + scx) & 0xFF; py = (ly + scy) & 0xFF;
+                mapBase = (lcdc & 0x08) ? 0x1C00 : 0x1800;
+            }
+            uint16_t mapAddr = (uint16_t)(mapBase + (py / 8) * 32 + (px / 8));
+            uint8_t tile = vram[mapAddr];
+            uint8_t attr = cgb ? vram1[mapAddr] : 0;
+            int tileRow = py & 7, tileCol = px & 7;
+            if (attr & 0x40) tileRow = 7 - tileRow;
+            if (attr & 0x20) tileCol = 7 - tileCol;
+            uint16_t tileAddr = (lcdc & 0x10) ? (uint16_t)(tile * 16) : (uint16_t)(0x1000 + (int8_t)tile * 16);
+            tileAddr = (uint16_t)(tileAddr + tileRow * 2);
+            int bank = (attr & 0x08) ? 1 : 0;
+            uint8_t lo = vramBankRead(bank, tileAddr), hi = vramBankRead(bank, (uint16_t)(tileAddr + 1));
+            int bit = 7 - tileCol;
+            uint8_t ci = (uint8_t)((((hi >> bit) & 1) << 1) | ((lo >> bit) & 1));
+            bgIdx[x] = ci;
+            bgAttrPrio[x] = (attr & 0x80) ? 1 : 0;
+            if (cgb) {
+                int pi = (attr & 7) * 8 + ci * 2;
+                row[x] = rgb555ToArgb((uint16_t)(bgPaletteRam[pi] | (bgPaletteRam[pi + 1] << 8)));
+            } else {
+                row[x] = dmgShade((bgp >> (ci * 2)) & 3);
+            }
+        }
+        if (winUsed) windowInternalLine++;
+
+        if (!(lcdc & 0x02)) return;
+        int idx[10];
+        int n = spritesOnLine(ly, idx);
+        int order[10];
+        for (int i = 0; i < n; ++i) order[i] = idx[i];
+        if (!cgb) {
+            std::stable_sort(order, order + n, [&](int p, int q) { return oam[p * 4 + 1] < oam[q * 4 + 1]; });
+        }
+        int hgt = (lcdc & 0x04) ? 16 : 8;
+        bool claimed[GB_WIDTH] = {false};
+        for (int k = 0; k < n; ++k) {
+            int i = order[k];
+            int sy = oam[i * 4] - 16, sx = oam[i * 4 + 1] - 8;
+            uint8_t tile = oam[i * 4 + 2], fl = oam[i * 4 + 3];
+            if (hgt == 16) tile &= 0xFE;
+            int line = ly - sy;
+            if (fl & 0x40) line = hgt - 1 - line;
+            uint16_t addr = (uint16_t)(tile * 16 + line * 2);
+            int bank = (cgb && (fl & 0x08)) ? 1 : 0;
+            uint8_t lo = vramBankRead(bank, addr), hi = vramBankRead(bank, (uint16_t)(addr + 1));
+            for (int p = 0; p < 8; ++p) {
+                int x = sx + p;
+                if (x < 0 || x >= GB_WIDTH || claimed[x]) continue;
+                int bit = (fl & 0x20) ? p : 7 - p;
+                uint8_t ci = (uint8_t)((((hi >> bit) & 1) << 1) | ((lo >> bit) & 1));
+                if (ci == 0) continue;
+                claimed[x] = true;
+                bool hide;
+                if (cgb) hide = (lcdc & 0x01) && bgIdx[x] != 0 && ((fl & 0x80) || bgAttrPrio[x]);
+                else hide = (fl & 0x80) && bgIdx[x] != 0;
+                if (hide) continue;
+                if (cgb) {
+                    int pi = (fl & 7) * 8 + ci * 2;
+                    row[x] = rgb555ToArgb((uint16_t)(objPaletteRam[pi] | (objPaletteRam[pi + 1] << 8)));
+                } else {
+                    uint8_t pal = (fl & 0x10) ? obp1 : obp0;
+                    row[x] = dmgShade((pal >> (ci * 2)) & 3);
+                }
+            }
+        }
+    }
+
+    // ================================================================ OAM bug (DMG)
+    bool oamBugActive() const {
+        return !isCgbMode && (lcdc & 0x80) && ppuMode == 2 && !lcdFirstLine && ly < 144;
+    }
+    int oamBugRow() const { return lineDot / 4 + oamBugRowOffset; }
+    uint16_t oamWord(int r, int w) const { return (uint16_t)(oam[r * 8 + w * 2] | (oam[r * 8 + w * 2 + 1] << 8)); }
+    void setOamWord(int r, int w, uint16_t v) { oam[r * 8 + w * 2] = v & 0xFF; oam[r * 8 + w * 2 + 1] = v >> 8; }
+    void oamCopyRow(int dst, int src) { for (int i = 0; i < 8; ++i) oam[dst * 8 + i] = oam[src * 8 + i]; }
+    void oamCorruptWrite() {
+        int r = oamBugRow();
+        if (r < 1 || r >= 20) return;
+        uint16_t aa = oamWord(r, 0), bb = oamWord(r - 1, 0), cc = oamWord(r - 1, 2);
+        setOamWord(r, 0, (uint16_t)(((aa ^ cc) & (bb ^ cc)) ^ cc));
+        for (int w = 1; w < 4; ++w) setOamWord(r, w, oamWord(r - 1, w));
+    }
+    void oamCorruptRead() {
+        int r = oamBugRow();
+        if (r < 1 || r >= 20) return;
+        uint16_t aa = oamWord(r, 0), bb = oamWord(r - 1, 0), cc = oamWord(r - 1, 2);
+        setOamWord(r, 0, (uint16_t)(bb | (aa & cc)));
+        for (int w = 1; w < 4; ++w) setOamWord(r, w, oamWord(r - 1, w));
+    }
+    void oamCorruptReadInc() {
+        int r = oamBugRow();
+        if (r >= 4 && r < 19) {
+            uint16_t aa = oamWord(r - 2, 0), bb = oamWord(r - 1, 0), cc = oamWord(r, 0), dd = oamWord(r - 1, 2);
+            setOamWord(r - 1, 0, (uint16_t)((bb & (aa | cc | dd)) | (aa & cc & dd)));
+            oamCopyRow(r, r - 1);
+            oamCopyRow(r - 2, r - 1);
+        }
+    }
+    static bool inOamRange(uint16_t v) { return v >= 0xFE00 && v <= 0xFEFF; }
+
+    // ================================================================ bus CPU
+    uint8_t ioRead(uint16_t addr) {
+        if (addr >= 0xFF10 && addr <= 0xFF3F) return apu.read(addr);
+        switch (addr) {
+            case 0xFF00: return readJoyp();
+            case 0xFF01: return sb;
+            case 0xFF02: return sc | (isCgbMode ? 0x7C : 0x7E);
+            case 0xFF04: return (uint8_t)(divCounter >> 8);
+            case 0xFF05: return tima;
+            case 0xFF06: return tma;
+            case 0xFF07: return tac | 0xF8;
+            case 0xFF0F: return iflag | 0xE0;
+            case 0xFF40: return lcdc;
+            case 0xFF41: return (lcdc & 0x80) ? ((stat & 0xFC) | statModeSnap | 0x80) : ((stat & 0xFC) | 0x80);
+            case 0xFF42: return scy;
+            case 0xFF43: return scx;
+            case 0xFF44: return (lcdc & 0x80) ? lyReg : 0;
+            case 0xFF45: return lyc;
+            case 0xFF46: return dmaReg;
+            case 0xFF47: return bgp;
+            case 0xFF48: return obp0;
+            case 0xFF49: return obp1;
+            case 0xFF4A: return wy;
+            case 0xFF4B: return wx;
+            default: break;
+        }
+        if (!isCgbMode) return 0xFF;
+        switch (addr) {
+            case 0xFF4D: return (uint8_t)(0x7E | (cgbDoubleSpeed ? 0x80 : 0) | (key1Armed & 1));
+            case 0xFF4F: return vbk | 0xFE;
+            case 0xFF55: return hdmaActive ? (uint8_t)((hdmaBlocksLeft - 1) & 0x7F) : hdmaStatus;
+            case 0xFF68: return bcps | 0x40;
+            case 0xFF69: return vramBlocked() ? 0xFF : bgPaletteRam[bcps & 0x3F];
+            case 0xFF6A: return ocps | 0x40;
+            case 0xFF6B: return vramBlocked() ? 0xFF : objPaletteRam[ocps & 0x3F];
+            case 0xFF6C: return opri | 0xFE;
+            case 0xFF70: return svbk | 0xF8;
+            case 0xFF72: return ff72;
+            case 0xFF73: return ff73;
+            case 0xFF74: return ff74;
+            case 0xFF75: return ff75 | 0x8F;
+            case 0xFF76: return apu.pcm12();
+            case 0xFF77: return apu.pcm34();
+            default: return 0xFF;
+        }
+    }
+
+    void ioWrite(uint16_t addr, uint8_t v) {
+        if (addr >= 0xFF10 && addr <= 0xFF3F) { apu.write(addr, v); return; }
+        switch (addr) {
+            case 0xFF00: joypSelect = v & 0x30; return;
+            case 0xFF01: sb = v; return;
+            case 0xFF02:
+                sc = v;
+                if ((v & 0x81) == 0x81) {
+                    serialOut.push_back((char)sb);
+                    serialCycles = (isCgbMode && (v & 0x02)) ? 32 : 1024;
+                }
+                return;
+            case 0xFF04: writeDiv(); return;
+            case 0xFF05:
+                if (timaState == 2) return;
+                if (timaState == 1) timaState = 0;
+                tima = v; return;
+            case 0xFF06: tma = v; if (timaState == 2) tima = v; return;
+            case 0xFF07: writeTac(v); return;
+            case 0xFF0F: iflag = v | 0xE0; return;
+            case 0xFF40: writeLcdc(v); return;
+            case 0xFF41: {
+                if (!isCgbMode && (lcdc & 0x80) && !statLine &&
+                    (ppuMode == 0 || ppuMode == 1 || (lyReg == lyc))) iflag |= 0x02;
+                stat = (uint8_t)((stat & 0x07) | (v & 0x78));
+                updateStat();
+                return;
+            }
+            case 0xFF42: scy = v; return;
+            case 0xFF43: scx = v; return;
+            case 0xFF44: return;
+            case 0xFF45: lyc = v; if (lcdc & 0x80) updateStat(); return;
+            case 0xFF46: dmaReg = v; dmaPendingSrc = (uint16_t)(v << 8); dmaStartDelay = 2; return;
+            case 0xFF47: bgp = v; return;
+            case 0xFF48: obp0 = v; return;
+            case 0xFF49: obp1 = v; return;
+            case 0xFF4A: wy = v; return;
+            case 0xFF4B: wx = v; return;
+            default: break;
+        }
+        if (!isCgbMode) return;
+        switch (addr) {
+            case 0xFF4D: key1Armed = v & 1; return;
+            case 0xFF4F: vbk = v & 1; return;
+            case 0xFF51: hdmaSrc = (uint16_t)((hdmaSrc & 0x00F0) | (v << 8)); return;
+            case 0xFF52: hdmaSrc = (uint16_t)((hdmaSrc & 0xFF00) | (v & 0xF0)); return;
+            case 0xFF53: hdmaDst = (uint16_t)((hdmaDst & 0x00F0) | ((v & 0x1F) << 8)); return;
+            case 0xFF54: hdmaDst = (uint16_t)((hdmaDst & 0x1F00) | (v & 0xF0)); return;
+            case 0xFF55: writeHdma5(v); return;
+            case 0xFF68: bcps = v & 0xBF; return;
+            case 0xFF69:
+                if (!vramBlocked()) bgPaletteRam[bcps & 0x3F] = v;
+                if (bcps & 0x80) bcps = (uint8_t)(0x80 | ((bcps + 1) & 0x3F));
+                return;
+            case 0xFF6A: ocps = v & 0xBF; return;
+            case 0xFF6B:
+                if (!vramBlocked()) objPaletteRam[ocps & 0x3F] = v;
+                if (ocps & 0x80) ocps = (uint8_t)(0x80 | ((ocps + 1) & 0x3F));
+                return;
+            case 0xFF6C: opri = v & 1; return;
+            case 0xFF70: svbk = v & 7; return;
+            case 0xFF72: ff72 = v; return;
+            case 0xFF73: ff73 = v; return;
+            case 0xFF74: ff74 = v; return;
+            case 0xFF75: ff75 = v & 0x70; return;
+            default: return;
+        }
+    }
+
+    uint8_t readByte(uint16_t addr) {
+        if (addr < 0x8000) return romRead(addr);
+        if (addr < 0xA000) {
+            if (vramBlocked()) return 0xFF;
+            return (isCgbMode && vbk) ? vram1[addr - 0x8000] : vram[addr - 0x8000];
+        }
+        if (addr < 0xC000) return cartRamRead(addr);
+        if (addr < 0xFE00) return wramRead(addr);
+        if (addr < 0xFF00) {
+            if (oamBugActive()) oamCorruptRead();
+            if (dmaActive || oamBlocked()) return 0xFF;
+            if (addr >= 0xFEA0) return 0x00;
+            return oam[addr - 0xFE00];
+        }
+        if (addr < 0xFF80) return ioRead(addr);
+        if (addr < 0xFFFF) return hram[addr - 0xFF80];
+        return ie;
+    }
+
+    void writeByte(uint16_t addr, uint8_t v) {
+        if (addr < 0x8000) { mbcWrite(addr, v); return; }
+        if (addr < 0xA000) {
+            if (vramBlocked()) return;
+            if (isCgbMode && vbk) vram1[addr - 0x8000] = v; else vram[addr - 0x8000] = v;
+            return;
+        }
+        if (addr < 0xC000) { cartRamWrite(addr, v); return; }
+        if (addr < 0xFE00) { wramWrite(addr, v); return; }
+        if (addr < 0xFF00) {
+            if (oamBugActive()) oamCorruptWrite();
+            if (dmaActive || oamBlocked() || addr >= 0xFEA0) return;
+            oam[addr - 0xFE00] = v;
+            return;
+        }
+        if (addr < 0xFF80) { ioWrite(addr, v); return; }
+        if (addr < 0xFFFF) { hram[addr - 0xFF80] = v; return; }
+        ie = v;
+    }
+
+    // ================================================================ reloj
+    void tickM() {
+        timerTickM();
+        if (serialCycles > 0 && --serialCycles == 0) { sb = 0xFF; sc &= 0x7F; iflag |= 0x08; }
+        dmaTickM();
+        statModeSnap = ppuMode;
+        int dots = dotsPerM();
+        for (int i = 0; i < dots; ++i) ppuDot();
+        apu.run(dots);
+        rtcTick(dots);
+        frameDots += dots;
+    }
+
+    uint8_t rd(uint16_t addr) { tickM(); return readByte(addr); }
+    void wr(uint16_t addr, uint8_t v) { tickM(); writeByte(addr, v); }
+    void idle() { tickM(); }
+    // ciclo interno con incremento/decremento de 16 bits (bug OAM en DMG)
+    void idleInc(uint16_t v) { tickM(); if (inOamRange(v) && oamBugActive()) oamCorruptWrite(); }
+    uint8_t rdInc(uint16_t addr) {
+        tickM();
+        if (inOamRange(addr) && oamBugActive()) oamCorruptReadInc();
+        return readByte(addr);
+    }
+    uint8_t fetch8() {
+        uint8_t v = rd(pc);
+        if (haltBugPending) haltBugPending = false; else pc++;
+        return v;
+    }
+    uint16_t fetch16() { uint8_t lo = fetch8(); uint8_t hi = fetch8(); return (uint16_t)(lo | (hi << 8)); }
+
+    // ================================================================ registros
+    uint16_t getBC() const { return (uint16_t)((b << 8) | c); }
+    uint16_t getDE() const { return (uint16_t)((d << 8) | e); }
+    uint16_t getHL() const { return (uint16_t)((h << 8) | l); }
+    uint16_t getAF() const { return (uint16_t)((a << 8) | (f & 0xF0)); }
+    void setBC(uint16_t v) { b = v >> 8; c = v & 0xFF; }
+    void setDE(uint16_t v) { d = v >> 8; e = v & 0xFF; }
+    void setHL(uint16_t v) { h = v >> 8; l = v & 0xFF; }
+    void setAF(uint16_t v) { a = v >> 8; f = v & 0xF0; }
+    uint16_t getRP(int i) const { switch (i) { case 0: return getBC(); case 1: return getDE(); case 2: return getHL(); default: return sp; } }
+    void setRP(int i, uint16_t v) { switch (i) { case 0: setBC(v); break; case 1: setDE(v); break; case 2: setHL(v); break; default: sp = v; } }
+    uint16_t getRP2(int i) const { return i == 3 ? getAF() : getRP(i); }
+    void setRP2(int i, uint16_t v) { if (i == 3) setAF(v); else setRP(i, v); }
+
+    uint8_t getR(int i) {
+        switch (i) { case 0: return b; case 1: return c; case 2: return d; case 3: return e;
+                     case 4: return h; case 5: return l; case 6: return rd(getHL()); default: return a; }
+    }
+    void setR(int i, uint8_t v) {
+        switch (i) { case 0: b = v; break; case 1: c = v; break; case 2: d = v; break; case 3: e = v; break;
+                     case 4: h = v; break; case 5: l = v; break; case 6: wr(getHL(), v); break; default: a = v; }
+    }
+    bool flagZ() const { return f & 0x80; }
+    bool flagC() const { return f & 0x10; }
+    void setFlags(bool z, bool n, bool hh, bool cy) {
+        f = (uint8_t)((z ? 0x80 : 0) | (n ? 0x40 : 0) | (hh ? 0x20 : 0) | (cy ? 0x10 : 0));
+    }
+    bool cond(int cc) const {
+        switch (cc) { case 0: return !flagZ(); case 1: return flagZ(); case 2: return !flagC(); default: return flagC(); }
+    }
+
+    void alu(int op, uint8_t v) {
+        int r;
+        switch (op) {
+            case 0: r = a + v; setFlags((r & 0xFF) == 0, false, ((a & 0xF) + (v & 0xF)) > 0xF, r > 0xFF); a = (uint8_t)r; break;
+            case 1: { int cy = flagC() ? 1 : 0; r = a + v + cy;
+                      setFlags((r & 0xFF) == 0, false, ((a & 0xF) + (v & 0xF) + cy) > 0xF, r > 0xFF); a = (uint8_t)r; break; }
+            case 2: r = a - v; setFlags((r & 0xFF) == 0, true, (a & 0xF) < (v & 0xF), r < 0); a = (uint8_t)r; break;
+            case 3: { int cy = flagC() ? 1 : 0; r = a - v - cy;
+                      setFlags((r & 0xFF) == 0, true, ((a & 0xF) - (v & 0xF) - cy) < 0, r < 0); a = (uint8_t)r; break; }
+            case 4: a &= v; setFlags(a == 0, false, true, false); break;
+            case 5: a ^= v; setFlags(a == 0, false, false, false); break;
+            case 6: a |= v; setFlags(a == 0, false, false, false); break;
+            default: r = a - v; setFlags((r & 0xFF) == 0, true, (a & 0xF) < (v & 0xF), r < 0); break;
+        }
+    }
+
+    void push16(uint16_t v) { sp--; wr(sp, v >> 8); sp--; wr(sp, v & 0xFF); }
+    uint16_t pop16() { uint8_t lo = rdInc(sp); sp++; uint8_t hi = rd(sp); sp++; return (uint16_t)(lo | (hi << 8)); }
+
+    uint16_t addSpE() {
+        int8_t ev = (int8_t)fetch8();
+        uint16_t r = (uint16_t)(sp + ev);
+        setFlags(false, false, ((sp & 0xF) + ((uint8_t)ev & 0xF)) > 0xF, ((sp & 0xFF) + (uint8_t)ev) > 0xFF);
+        return r;
+    }
+
+    void executeCB() {
+        uint8_t op = fetch8();
+        int r = op & 7, bit = (op >> 3) & 7;
+        uint8_t v = getR(r);
+        switch (op >> 6) {
+            case 0: {
+                uint8_t res = 0; bool cy = false;
+                switch (bit) {
+                    case 0: cy = v & 0x80; res = (uint8_t)((v << 1) | (v >> 7)); break;
+                    case 1: cy = v & 1; res = (uint8_t)((v >> 1) | (v << 7)); break;
+                    case 2: cy = v & 0x80; res = (uint8_t)((v << 1) | (flagC() ? 1 : 0)); break;
+                    case 3: cy = v & 1; res = (uint8_t)((v >> 1) | (flagC() ? 0x80 : 0)); break;
+                    case 4: cy = v & 0x80; res = (uint8_t)(v << 1); break;
+                    case 5: cy = v & 1; res = (uint8_t)((v >> 1) | (v & 0x80)); break;
+                    case 6: cy = false; res = (uint8_t)((v << 4) | (v >> 4)); break;
+                    default: cy = v & 1; res = (uint8_t)(v >> 1); break;
+                }
+                setFlags(res == 0, false, false, cy);
+                setR(r, res);
+                break;
+            }
+            case 1: f = (uint8_t)((f & 0x10) | 0x20 | (((v >> bit) & 1) ? 0 : 0x80)); break;
+            case 2: setR(r, (uint8_t)(v & ~(1 << bit))); break;
+            default: setR(r, (uint8_t)(v | (1 << bit))); break;
+        }
+    }
+
+    void execute(uint8_t op) {
+        if (op >= 0x40 && op < 0x80) {
+            if (op == 0x76) {
+                if (!ime && (ie & iflag & 0x1F)) {
+                    if (imeEnablePending) halted = false;
+                    else haltBugPending = true;
+                } else halted = true;
+                return;
+            }
+            setR((op >> 3) & 7, getR(op & 7));
+            return;
+        }
+        if (op >= 0x80 && op < 0xC0) { alu((op >> 3) & 7, getR(op & 7)); return; }
+        switch (op) {
+            case 0x00: return;
+            case 0x01: case 0x11: case 0x21: case 0x31: setRP(op >> 4, fetch16()); return;
+            case 0x02: wr(getBC(), a); return;
+            case 0x12: wr(getDE(), a); return;
+            case 0x22: { uint16_t hl = getHL(); wr(hl, a); setHL((uint16_t)(hl + 1)); return; }
+            case 0x32: { uint16_t hl = getHL(); wr(hl, a); setHL((uint16_t)(hl - 1)); return; }
+            case 0x0A: a = rd(getBC()); return;
+            case 0x1A: a = rd(getDE()); return;
+            case 0x2A: { uint16_t hl = getHL(); a = rdInc(hl); setHL((uint16_t)(hl + 1)); return; }
+            case 0x3A: { uint16_t hl = getHL(); a = rdInc(hl); setHL((uint16_t)(hl - 1)); return; }
+            case 0x03: case 0x13: case 0x23: case 0x33: { int i = op >> 4; uint16_t v = getRP(i); idleInc(v); setRP(i, (uint16_t)(v + 1)); return; }
+            case 0x0B: case 0x1B: case 0x2B: case 0x3B: { int i = op >> 4; uint16_t v = getRP(i); idleInc(v); setRP(i, (uint16_t)(v - 1)); return; }
+            case 0x04: case 0x0C: case 0x14: case 0x1C: case 0x24: case 0x2C: case 0x34: case 0x3C: {
+                int r = (op >> 3) & 7; uint8_t v = getR(r); uint8_t res = (uint8_t)(v + 1);
+                f = (uint8_t)((f & 0x10) | (res == 0 ? 0x80 : 0) | ((v & 0xF) == 0xF ? 0x20 : 0));
+                setR(r, res); return;
+            }
+            case 0x05: case 0x0D: case 0x15: case 0x1D: case 0x25: case 0x2D: case 0x35: case 0x3D: {
+                int r = (op >> 3) & 7; uint8_t v = getR(r); uint8_t res = (uint8_t)(v - 1);
+                f = (uint8_t)((f & 0x10) | 0x40 | (res == 0 ? 0x80 : 0) | ((v & 0xF) == 0 ? 0x20 : 0));
+                setR(r, res); return;
+            }
+            case 0x06: case 0x0E: case 0x16: case 0x1E: case 0x26: case 0x2E: case 0x36: case 0x3E: {
+                uint8_t v = fetch8(); setR((op >> 3) & 7, v); return;
+            }
+            case 0x07: { bool cy = a & 0x80; a = (uint8_t)((a << 1) | (a >> 7)); setFlags(false, false, false, cy); return; }
+            case 0x0F: { bool cy = a & 1; a = (uint8_t)((a >> 1) | (a << 7)); setFlags(false, false, false, cy); return; }
+            case 0x17: { bool cy = a & 0x80; a = (uint8_t)((a << 1) | (flagC() ? 1 : 0)); setFlags(false, false, false, cy); return; }
+            case 0x1F: { bool cy = a & 1; a = (uint8_t)((a >> 1) | (flagC() ? 0x80 : 0)); setFlags(false, false, false, cy); return; }
+            case 0x08: { uint16_t nn = fetch16(); wr(nn, sp & 0xFF); wr((uint16_t)(nn + 1), sp >> 8); return; }
+            case 0x09: case 0x19: case 0x29: case 0x39: {
+                uint16_t hl = getHL(), v = getRP(op >> 4);
+                uint32_t r = hl + v;
+                f = (uint8_t)((f & 0x80) | (((hl & 0xFFF) + (v & 0xFFF)) > 0xFFF ? 0x20 : 0) | (r > 0xFFFF ? 0x10 : 0));
+                idle(); setHL((uint16_t)r); return;
+            }
+            case 0x10: {
+                fetch8();
+                if (isCgbMode && key1Armed) {
+                    cgbDoubleSpeed = !cgbDoubleSpeed;
+                    key1Armed = 0;
+                    for (int i = 0; i < 2050; ++i) idle();
+                    divCounter = 0;
+                } else {
+                    divCounter = 0;
+                }
+                return;
+            }
+            case 0x18: { int8_t ev = (int8_t)fetch8(); idle(); pc = (uint16_t)(pc + ev); return; }
+            case 0x20: case 0x28: case 0x30: case 0x38: {
+                int8_t ev = (int8_t)fetch8();
+                if (cond((op >> 3) & 3)) { idle(); pc = (uint16_t)(pc + ev); }
+                return;
+            }
+            case 0x27: {
+                bool n = f & 0x40, hh = f & 0x20, cy = f & 0x10;
+                if (!n) {
+                    if (cy || a > 0x99) { a = (uint8_t)(a + 0x60); cy = true; }
+                    if (hh || (a & 0x0F) > 9) a = (uint8_t)(a + 6);
+                } else {
+                    if (cy) a = (uint8_t)(a - 0x60);
+                    if (hh) a = (uint8_t)(a - 6);
+                }
+                f = (uint8_t)((a == 0 ? 0x80 : 0) | (n ? 0x40 : 0) | (cy ? 0x10 : 0));
+                return;
+            }
+            case 0x2F: a = (uint8_t)~a; f = (uint8_t)(f | 0x60); return;
+            case 0x37: f = (uint8_t)((f & 0x80) | 0x10); return;
+            case 0x3F: f = (uint8_t)((f & 0x80) | ((f & 0x10) ? 0 : 0x10)); return;
+            case 0xC0: case 0xC8: case 0xD0: case 0xD8:
+                idle();
+                if (cond((op >> 3) & 3)) { pc = pop16(); idle(); }
+                return;
+            case 0xC9: pc = pop16(); idle(); return;
+            case 0xD9: pc = pop16(); idle(); ime = true; imeEnablePending = false; return;
+            case 0xC1: case 0xD1: case 0xE1: case 0xF1: setRP2((op >> 4) & 3, pop16()); return;
+            case 0xC5: case 0xD5: case 0xE5: case 0xF5: idleInc(sp); push16(getRP2((op >> 4) & 3)); return;
+            case 0xC2: case 0xCA: case 0xD2: case 0xDA: {
+                uint16_t nn = fetch16();
+                if (cond((op >> 3) & 3)) { idle(); pc = nn; }
+                return;
+            }
+            case 0xC3: { uint16_t nn = fetch16(); idle(); pc = nn; return; }
+            case 0xC4: case 0xCC: case 0xD4: case 0xDC: {
+                uint16_t nn = fetch16();
+                if (cond((op >> 3) & 3)) { idleInc(sp); push16(pc); pc = nn; }
+                return;
+            }
+            case 0xCD: { uint16_t nn = fetch16(); idleInc(sp); push16(pc); pc = nn; return; }
+            case 0xC6: case 0xCE: case 0xD6: case 0xDE: case 0xE6: case 0xEE: case 0xF6: case 0xFE:
+                alu((op >> 3) & 7, fetch8()); return;
+            case 0xC7: case 0xCF: case 0xD7: case 0xDF: case 0xE7: case 0xEF: case 0xF7: case 0xFF:
+                idleInc(sp); push16(pc); pc = op & 0x38; return;
+            case 0xCB: executeCB(); return;
+            case 0xE0: { uint8_t n = fetch8(); wr((uint16_t)(0xFF00 | n), a); return; }
+            case 0xF0: { uint8_t n = fetch8(); a = rd((uint16_t)(0xFF00 | n)); return; }
+            case 0xE2: wr((uint16_t)(0xFF00 | c), a); return;
+            case 0xF2: a = rd((uint16_t)(0xFF00 | c)); return;
+            case 0xEA: { uint16_t nn = fetch16(); wr(nn, a); return; }
+            case 0xFA: { uint16_t nn = fetch16(); a = rd(nn); return; }
+            case 0xE8: { uint16_t r = addSpE(); idle(); idle(); sp = r; return; }
+            case 0xF8: { uint16_t r = addSpE(); idle(); setHL(r); return; }
+            case 0xF9: idleInc(getHL()); sp = getHL(); return;
+            case 0xE9: pc = getHL(); return;
+            case 0xF3: ime = false; imeEnablePending = false; return;
+            case 0xFB: imeEnablePending = true; return;
+            default: return; // opcodes ilegales: se tratan como NOP
+        }
+    }
+
+    void serviceInterrupt() {
+        if (haltBugPending) { haltBugPending = false; pc--; }
+        ime = false;
+        idle();
+        idleInc(sp);
+        sp--; wr(sp, pc >> 8);
+        uint8_t pend = ie & iflag & 0x1F;
+        sp--; wr(sp, pc & 0xFF);
+        idle();
+        if (!pend) { pc = 0; return; }
+        int bit = 0;
+        while (!((pend >> bit) & 1)) bit++;
+        iflag &= (uint8_t)~(1 << bit);
+        pc = (uint16_t)(0x40 + bit * 8);
+    }
+
+    // Ejecuta una instrucción (o un ciclo de espera). Devuelve dots consumidos.
+    int step() {
+        int64_t start = frameDots;
+        if (stallDots > 0) {
+            tickM();
+            stallDots -= dotsPerM();
+            if (stallDots < 0) stallDots = 0;
+            return (int)(frameDots - start);
+        }
+        if (halted) {
+            tickM();
+            if (ie & iflag & 0x1F) halted = false;
+            return (int)(frameDots - start);
+        }
+        if (ime && (ie & iflag & 0x1F)) {
+            serviceInterrupt();
+            return (int)(frameDots - start);
+        }
+        bool en = imeEnablePending;
+        uint8_t op = fetch8();
+        execute(op);
+        if (en && imeEnablePending) { ime = true; imeEnablePending = false; }
+        return (int)(frameDots - start);
+    }
+
+    void runFrame() {
+        while (frameDots < 70224) step();
+        frameDots -= 70224;
+    }
+
+    // ================================================================ save states
+    template <class F> void serialize(F& io) {
+        io(ext_ram); io(mbcType); io(hasRtc); io(hasBattery); io(ramSize); io(romBank); io(ramBank);
+        io(ramEnabled); io(mbcMode); io(rtcRegs); io(rtcLatched); io(rtcLatchPrev); io(rtcSubDots);
+        io(vram); io(vram1); io(wram); io(oam); io(hram); io(ie); io(iflag);
+        io(isCgbMode); io(vbk); io(svbk); io(key1Armed); io(opri); io(ff72); io(ff73); io(ff74); io(ff75);
+        io(cgbDoubleSpeed); io(bgPaletteRam); io(objPaletteRam); io(bcps); io(ocps);
+        io(hdmaSrc); io(hdmaDst); io(hdmaBlocksLeft); io(hdmaActive); io(hdmaStatus); io(stallDots);
+        io(dmaActive); io(dmaIndex); io(dmaReg); io(dmaSrc); io(dmaPendingSrc); io(dmaStartDelay); io(mbc1Multicart);
+        io(divCounter); io(tima); io(tma); io(tac); io(timaState);
+        io(sb); io(sc); io(serialCycles); io(joypSelect); io(buttonsState);
+        io(lcdc); io(stat); io(scy); io(scx); io(ly); io(lyReg); io(lyc); io(wy); io(wx);
+        io(bgp); io(obp0); io(obp1); io(lineDot); io(mode3End); io(ppuMode); io(statLine);
+        io(lcdFirstLine); io(wyTriggered); io(windowInternalLine); io(frameBuf);
+        io(pc); io(sp); io(a); io(f); io(b); io(c); io(d); io(e); io(h); io(l);
+        io(ime); io(imeEnablePending); io(halted); io(haltBugPending); io(frameDots);
+        io(apu.cgb); io(apu.power); io(apu.reg); io(apu.waveRam); io(apu.sq); io(apu.wv); io(apu.nz);
+        io(apu.swEn); io(apu.swNegUsed); io(apu.swTimer); io(apu.swShadow); io(apu.fsStep);
+    }
+};
+constexpr int Bus::kClockSelectBit[4];
+constexpr uint8_t Bus::kButtonBit[8];
+
+Bus g_bus;
+#ifndef REW_HEADLESS
 int g_active_slot = 0;
 bool g_emulation_paused = false;
 char g_rom_base_name[MAX_PATH] = "State";
+char g_rom_full_path[MAX_PATH] = "";
 int  g_window_scale = 2;
 
-// [v0.4] Audio enable + master volume
 bool g_audio_enabled = true;
 
-// [v0.4] Auto-fire
 bool g_auto_fire_enabled[2] = { false, false };   // 0=A, 1=B
 int  g_auto_fire_counter[2]  = { 0, 0 };
 const int AUTO_FIRE_FRAMES = 10;  // toggle cada 10 frames (~6 Hz)
 
-// [v0.4] 40 bindings: 10 actions x 4 slots. Actions:
-// 0=UP 1=DOWN 2=LEFT 3=RIGHT 4=A 5=B 6=AutoA 7=AutoB 8=Start 9=Select
+// Acciones: 0=UP 1=DOWN 2=LEFT 3=RIGHT 4=A 5=B 6=Select 7=Start
 DWORD g_bindings[8][4] = {
     { VK_UP,    0, 0, 0 }, { VK_DOWN,  0, 0, 0 },
     { VK_LEFT,  0, 0, 0 }, { VK_RIGHT, 0, 0, 0 },
@@ -44,1336 +1600,12 @@ const char* g_action_names[8] = {
 
 WNDPROC g_origEditProc[10][4] = { nullptr };
 
+// Comandos creados en tiempo de ejecución (el .rc no los incluye)
+#define ID_SYSTEM_AUTO   40040
+#define ID_SYSTEM_DMG    40041
+#define ID_AUDIO_TOGGLE  40042
+
 void ActualizarMenuDeEstados(HWND hWnd);
-
-// ============================================================================
-// [v0.4] APU
-// ============================================================================
-class APU {
-public:
-    uint8_t nr10=0x80,nr11=0xBF,nr12=0xF3,nr13=0xFF,nr14=0xBF;
-    uint8_t nr21=0x3F,nr22=0x00,nr23=0xFF,nr24=0xBF;
-    uint8_t nr30=0x7F,nr31=0xFF,nr32=0x9F,nr33=0xFF,nr34=0xBF;
-    uint8_t nr41=0xFF,nr42=0x00,nr43=0x00,nr44=0xBF;
-    uint8_t nr50=0x77,nr51=0xF3,nr52=0xF1;
-    uint8_t waveRam[16] = {0};
-
-    struct Ch {
-        bool enabled=false, dacEnabled=false;
-        bool lengthEnabled=false;
-        int timer=0, freq=0, dutyPos=0, duty=0, vol=0;
-        int lengthCounter=0;
-        int sweepTimer=0;
-        int envTimer=0;
-        int wavePos=0;
-        int lfsr=0x7FFF, divisor=0, shift=0;
-        bool widthMode=false;
-		int dacOutput = 0;
-    } c1, c2, c3, c4;
-
-    int frameSeqCounter = 0;
-    int frameSeqStep = 0;
-
-    static constexpr int SAMPLE_RATE = 44100;
-    static constexpr int SAMPLES_PER_FRAME = 800;
-    double cycleAcc = 0;
-    int16_t sampleBuf[SAMPLES_PER_FRAME * 2];   // interleaved L,R,L,R,...
-    int sampleCount = 0;
-
-    int32_t lpFilterL = 0, lpFilterR = 0;
-    int32_t dcPrevInL = 0, dcPrevOutL = 0;
-    int32_t dcPrevInR = 0, dcPrevOutR = 0;
-	int32_t hpFilterState = 0;
-	int32_t hpLastIn = 0;
-    int32_t hpLastOut = 0;
-
-    static constexpr uint8_t DUTY[4][8] = {
-        {0,0,0,0,0,0,0,1},
-        {1,0,0,0,0,0,0,1},
-        {1,0,0,0,0,1,1,1},
-        {0,1,1,1,1,1,1,0}
-    };
-
-    void reset() {
-        nr10=0x80;nr11=0xBF;nr12=0xF3;nr13=0xFF;nr14=0xBF;
-        nr21=0x3F;nr22=0x00;nr23=0xFF;nr24=0xBF;
-        nr30=0x7F;nr31=0xFF;nr32=0x9F;nr33=0xFF;nr34=0xBF;
-        nr41=0xFF;nr42=0x00;nr43=0x00;nr44=0xBF;
-        nr50=0x77;nr51=0xF3;nr52=0xF1;
-        for (int i=0;i<16;++i) waveRam[i]=0;
-        c1=c2=c3=c4=Ch(); c4.lfsr=0x7FFF;
-        cycleAcc=0; sampleCount=0;
-        frameSeqCounter=0; frameSeqStep=0;
-        lpFilterL = 0; lpFilterR = 0;
-        dcPrevInL = 0; dcPrevOutL = 0;
-        dcPrevInR = 0; dcPrevOutR = 0; 
-		hpFilterState = 0;
-		hpLastIn = 0;
-        hpLastOut = 0;
-		c1.dacOutput = 0;
-        c2.dacOutput = 0;
-        c3.dacOutput = 0;
-        c4.dacOutput = 0;
-    }
-
-    // ──────── Frame sequencer helpers ────────
-    void clockLength(Ch& ch, int maxLen) {
-        (void)maxLen;
-        if (!ch.lengthEnabled) return;
-        if (ch.lengthCounter > 0) {
-            ch.lengthCounter--;
-            if (ch.lengthCounter == 0) ch.enabled = false;
-        }
-    }
-
-    void clockEnvelope(Ch& ch) {
-        if (!ch.enabled) return;
-        int period, dir;
-        if (&ch == &c1)      { period = nr12 & 7; dir = (nr12 >> 3) & 1; }
-        else if (&ch == &c2) { period = nr22 & 7; dir = (nr22 >> 3) & 1; }
-        else                 { period = nr42 & 7; dir = (nr42 >> 3) & 1; }
-        if (period == 0) return;
-        if (--ch.envTimer <= 0) {
-            ch.envTimer = period;
-            if (dir) { if (ch.vol < 15) ch.vol++; }
-            else     { if (ch.vol > 0)  ch.vol--; }
-        }
-    }
-
-    void clockSweep() {
-        if (!c1.enabled) return;
-        int period = (nr10 >> 4) & 7;
-        if (period == 0) return;
-        if (--c1.sweepTimer <= 0) {
-            c1.sweepTimer = period;
-            int shift = nr10 & 7;
-            if (shift == 0) return;
-            int delta = c1.freq >> shift;
-            int newFreq = (nr10 & 0x08) ? (c1.freq - delta) : (c1.freq + delta);
-            if (newFreq > 2047) c1.enabled = false;
-            else if (newFreq >= 0) c1.freq = newFreq;
-        }
-    }
-
-    void tickFrameSeq() {
-        frameSeqStep = (frameSeqStep + 1) & 7;
-        if ((frameSeqStep & 1) == 0) {
-            clockLength(c1, 64);
-            clockLength(c2, 64);
-            clockLength(c3, 256);
-            clockLength(c4, 64);
-        }
-        if (frameSeqStep == 2 || frameSeqStep == 6) clockSweep();
-        if (frameSeqStep == 7) {
-            clockEnvelope(c1);
-            clockEnvelope(c2);
-            clockEnvelope(c4);
-        }
-    }
-
-    // ──────── Registros ────────
-    uint8_t readReg(uint16_t addr) {
-        // ★ Si APU está apagada, la mayoría de registros leen 0x00
-        if (!(nr52 & 0x80)) {
-            if (addr == 0xFF26) return nr52 | 0x70;   // NR52 siempre se lee
-            if (addr >= 0xFF30 && addr <= 0xFF3F) return waveRam[addr - 0xFF30];
-            // Los demás leen 0x00 (incluso NR11/NR21 pierden los bits de duty)
-            return 0x00;
-        }
-
-        // APU encendida: máscaras normales
-        switch(addr){
-            case 0xFF10: return nr10|0x80;
-            case 0xFF11: return nr11|0x3F;
-            case 0xFF12: return nr12;
-            case 0xFF13: return 0xFF;
-            case 0xFF14: return nr14|0xBF;
-            case 0xFF15: return 0xFF;
-            case 0xFF16: return nr21|0x3F;
-            case 0xFF17: return nr22;
-            case 0xFF18: return 0xFF;
-            case 0xFF19: return nr24|0xBF;
-            case 0xFF1A: return nr30|0x7F;
-            case 0xFF1B: return 0xFF;
-            case 0xFF1C: return nr32|0x9F;
-            case 0xFF1D: return 0xFF;
-            case 0xFF1E: return nr34|0xBF;
-            case 0xFF1F: return 0xFF;
-            case 0xFF20: return 0xFF;
-            case 0xFF21: return nr42;
-            case 0xFF22: return nr43;
-            case 0xFF23: return nr44|0xBF;
-            case 0xFF24: return nr50;
-            case 0xFF25: return nr51;
-            case 0xFF26: {
-                uint8_t r = nr52 | 0x70;
-                if (c1.enabled) r |= 0x01;
-                if (c2.enabled) r |= 0x02;
-                if (c3.enabled) r |= 0x04;
-                if (c4.enabled) r |= 0x08;
-                return r;
-            }
-            default:
-                if (addr >= 0xFF30 && addr <= 0xFF3F) return waveRam[addr - 0xFF30];
-                return 0xFF;
-        }
-    }
-
-    void writeReg(uint16_t addr, uint8_t val) {
-        if (addr >= 0xFF30 && addr <= 0xFF3F) { waveRam[addr - 0xFF30] = val; return; }
-        switch(addr) {
-            case 0xFF10: nr10 = val & 0x7F; return;
-
-            case 0xFF11: nr11 = val; c1.duty = (val >> 6) & 3;
-                         c1.lengthCounter = 64 - (val & 0x3F); return;
-
-            case 0xFF12: {
-                nr12 = val; c1.dacEnabled = (val & 0xF8) != 0;
-                if (!c1.dacEnabled) c1.enabled = false;
-                c1.vol = (val >> 4) & 0x0F;
-                return;
-            }
-
-            case 0xFF13: nr13 = val; c1.freq = (c1.freq & 0x700) | val; return;
-
-            case 0xFF14: {
-                nr14 = val & 0x7F;
-                c1.freq = (c1.freq & 0xFF) | ((val & 7) << 8);
-                bool wasLenEnabled = c1.lengthEnabled;
-                c1.lengthEnabled = (val & 0x40) != 0;
-
-                // ★ Trigger PRIMERO
-                if (val & 0x80) {
-                    c1.enabled = c1.dacEnabled;
-                    if (c1.lengthCounter == 0) c1.lengthCounter = 64;
-                    c1.timer = (2048 - c1.freq) * 4;
-                    if (c1.timer <= 0) c1.timer = 4;
-                    c1.dutyPos = 0;
-                    c1.envTimer = (nr12 & 7) ? (nr12 & 7) : 8;
-                    c1.sweepTimer = ((nr10 >> 4) & 7) ? ((nr10 >> 4) & 7) : 8;
-                }
-                // ★ Extra clock DESPUÉS, si estamos en la primera mitad del período
-                if (!wasLenEnabled && c1.lengthEnabled && (frameSeqStep % 2) == 0) {
-                    clockLength(c1, 64);
-                }
-                return;
-            }
-
-            case 0xFF16: nr21 = val; c2.duty = (val >> 6) & 3;
-                         c2.lengthCounter = 64 - (val & 0x3F); return;
-
-            case 0xFF17: {
-                nr22 = val; c2.dacEnabled = (val & 0xF8) != 0;
-                if (!c2.dacEnabled) c2.enabled = false;
-                c2.vol = (val >> 4) & 0x0F;
-                return;
-            }
-
-            case 0xFF18: nr23 = val; c2.freq = (c2.freq & 0x700) | val; return;
-
-            case 0xFF19: {
-                nr24 = val & 0x7F;
-                c2.freq = (c2.freq & 0xFF) | ((val & 7) << 8);
-                bool wasLenEnabled = c2.lengthEnabled;
-                c2.lengthEnabled = (val & 0x40) != 0;
-
-                if (val & 0x80) {
-                    c2.enabled = c2.dacEnabled;
-                    if (c2.lengthCounter == 0) c2.lengthCounter = 64;
-                    c2.timer = (2048 - c2.freq) * 4;
-                    if (c2.timer <= 0) c2.timer = 4;
-                    c2.dutyPos = 0;
-                    c2.envTimer = (nr22 & 7) ? (nr22 & 7) : 8;
-                }
-                if (!wasLenEnabled && c2.lengthEnabled && (frameSeqStep % 2) == 0) {
-                    clockLength(c2, 64);
-                }
-                return;
-            }
-
-            case 0xFF1A: nr30 = val & 0x7F; c3.dacEnabled = (val & 0x80) != 0;
-                         if (!c3.dacEnabled) c3.enabled = false; return;
-
-            case 0xFF1B: nr31 = val; c3.lengthCounter = 256 - val; return;
-            case 0xFF1C: nr32 = val; c3.vol = (val >> 5) & 3; return;
-            case 0xFF1D: nr33 = val; c3.freq = (c3.freq & 0x700) | val; return;
-
-            case 0xFF1E: {
-                nr34 = val & 0x7F;
-                c3.freq = (c3.freq & 0xFF) | ((val & 7) << 8);
-                bool wasLenEnabled = c3.lengthEnabled;
-                c3.lengthEnabled = (val & 0x40) != 0;
-
-                if (val & 0x80) {
-                    c3.enabled = c3.dacEnabled;
-                    if (c3.lengthCounter == 0) c3.lengthCounter = 256;
-                    c3.timer = (2048 - c3.freq) * 2;
-                    if (c3.timer <= 0) c3.timer = 2;
-                    c3.wavePos = 0;
-                }
-                if (!wasLenEnabled && c3.lengthEnabled && (frameSeqStep % 2) == 0) {
-                    clockLength(c3, 256);
-                }
-                return;
-            }
-
-            case 0xFF20: nr41 = val; c4.lengthCounter = 64 - (val & 0x3F); return;
-
-            case 0xFF21: {
-                nr42 = val; c4.dacEnabled = (val & 0xF8) != 0;
-                if (!c4.dacEnabled) c4.enabled = false;
-                c4.vol = (val >> 4) & 0x0F;
-                return;
-            }
-
-            case 0xFF22: nr43 = val; c4.shift = (val >> 4) & 0x0F;
-                         c4.widthMode = (val & 8) != 0; c4.divisor = val & 7; return;
-
-            case 0xFF23: {
-                nr44 = val & 0x7F;
-                bool wasLenEnabled = c4.lengthEnabled;
-                c4.lengthEnabled = (val & 0x40) != 0;
-
-                if (val & 0x80) {
-                    c4.enabled = c4.dacEnabled;
-                    if (c4.lengthCounter == 0) c4.lengthCounter = 64;
-                    c4.lfsr = 0x7FFF;
-                    c4.envTimer = (nr42 & 7) ? (nr42 & 7) : 8;
-                }
-                if (!wasLenEnabled && c4.lengthEnabled && (frameSeqStep % 2) == 0) {
-                    clockLength(c4, 64);
-                }
-                return;
-            }
-
-            case 0xFF24: nr50 = val; return;
-            case 0xFF25: nr51 = val; return;
-
-            case 0xFF26: {
-                nr52 = val & 0x80;
-                if (!(val & 0x80)) {
-                    c1.enabled=c2.enabled=c3.enabled=c4.enabled=false;
-                    nr10=nr11=nr12=nr13=nr14=0;
-                    nr21=nr22=nr23=nr24=0;
-                    nr30=nr31=nr32=nr33=nr34=0;
-                    nr41=nr42=nr43=nr44=0;
-                }
-                return;
-            }
-        }
-    }
-
-    void tick(int tCycles) {
-        static constexpr double cyclesPerOversample = 4194304.0 / (SAMPLE_RATE * 4);
-        int remaining = tCycles;
-        int32_t sumL = 0, sumR = 0;
-        int oversampleCount = 0;
-
-        while (remaining > 0) {
-            int step = (int)(cyclesPerOversample - cycleAcc) + 1;
-            if (step < 1) step = 1;
-            if (step > remaining) step = remaining;
-
-            int fsRemaining = 8192 - frameSeqCounter;
-            if (fsRemaining < step) step = fsRemaining;
-
-            advancePulse(c1, step);
-            advancePulse(c2, step);
-            advanceWave(step);
-            advanceNoise(step);
-
-            cycleAcc += step;
-            frameSeqCounter += step;
-            remaining -= step;
-
-            if (frameSeqCounter >= 8192) {
-                frameSeqCounter -= 8192;
-                tickFrameSeq();
-            }
-
-            if (cycleAcc >= cyclesPerOversample) {
-                cycleAcc -= cyclesPerOversample;
-
-                int32_t rawL, rawR;
-                generateSampleLR(rawL, rawR);
-
-                // Filtro IIR anti-aliasing por canal
-                lpFilterL += (rawL - lpFilterL) / 2;
-                lpFilterR += (rawR - lpFilterR) / 2;
-
-                sumL += lpFilterL;
-                sumR += lpFilterR;
-                oversampleCount++;
-
-                if (oversampleCount >= 4) {
-                    int32_t avgL = sumL / 4;
-                    int32_t avgR = sumR / 4;
-
-                    // HPF DC-block por canal
-                    int64_t hpL = (int64_t)avgL - dcPrevInL + ((int64_t)dcPrevOutL * 998943) / 1000000;
-                    int64_t hpR = (int64_t)avgR - dcPrevInR + ((int64_t)dcPrevOutR * 998943) / 1000000;
-                    dcPrevInL = avgL; dcPrevOutL = hpL;
-                    dcPrevInR = avgR; dcPrevOutR = hpR;
-
-                    if (hpL < -32768) hpL = -32768;
-                    if (hpL > 32767) hpL = 32767;
-                    if (hpR < -32768) hpR = -32768;
-                    if (hpR > 32767) hpR = 32767;
-
-                    if (sampleCount + 1 < SAMPLES_PER_FRAME * 2) {
-                        sampleBuf[sampleCount++] = (int16_t)hpL;
-                        sampleBuf[sampleCount++] = (int16_t)hpR;
-                    }
-
-                    sumL = 0; sumR = 0;
-                    oversampleCount = 0;
-                }
-            }
-        }
-    }
-
-    void advancePulse(Ch& ch, int cycles) {
-        if (!ch.enabled) return;
-        ch.timer -= cycles;
-        while (ch.timer <= 0) {
-            ch.timer += (2048 - ch.freq) * 4;
-            ch.dutyPos = (ch.dutyPos + 1) & 7;
-        }
-    }
-
-    void advanceWave(int cycles) {
-        if (!c3.enabled) return;
-        c3.timer -= cycles;
-        while (c3.timer <= 0) {
-            c3.timer += (2048 - c3.freq) * 2;
-            c3.wavePos = (c3.wavePos + 1) & 31;
-        }
-    }
-
-    void advanceNoise(int cycles) {
-        if (!c4.enabled) return;
-        int divisor = c4.divisor == 0 ? 8 : (c4.divisor * 16);
-        int period = divisor << c4.shift;
-        if (period < 4) period = 4;
-        c4.timer -= cycles;
-        while (c4.timer <= 0) {
-            c4.timer += period;
-            int bit = (c4.lfsr & 1) ^ ((c4.lfsr >> 1) & 1);
-            c4.lfsr = (c4.lfsr >> 1) | (bit << 14);
-            if (c4.widthMode) {
-                c4.lfsr = (c4.lfsr & ~(1u << 6)) | (bit << 6);
-            }
-        }
-    }
-	
-    void generateSampleLR(int32_t& outL, int32_t& outR) {
-        int ch1Out = 0, ch2Out = 0, ch3Out = 0, ch4Out = 0;
-
-        // Canal 1 - slew limiter
-        {
-            int target;
-            if (c1.dacEnabled) {
-                if (c1.enabled) {
-                    int d = DUTY[c1.duty][c1.dutyPos];
-                    target = d ? (15 - c1.vol * 2) : 15;
-                } else target = 15;
-            } else target = 0;
-            int diff = target - c1.dacOutput;
-            if (diff > 4) diff = 4;
-            if (diff < -4) diff = -4;
-            c1.dacOutput += diff;
-            ch1Out = c1.dacOutput;
-        }
-
-        // Canal 2
-        {
-            int target;
-            if (c2.dacEnabled) {
-                if (c2.enabled) {
-                    int d = DUTY[c2.duty][c2.dutyPos];
-                    target = d ? (15 - c2.vol * 2) : 15;
-                } else target = 15;
-            } else target = 0;
-            int diff = target - c2.dacOutput;
-            if (diff > 4) diff = 4;
-            if (diff < -4) diff = -4;
-            c2.dacOutput += diff;
-            ch2Out = c2.dacOutput;
-        }
-
-        // Canal 3
-        {
-            int target;
-            if (c3.dacEnabled) {
-                if (c3.enabled) {
-                    uint8_t byte = waveRam[(c3.wavePos >> 1) & 15];
-                    int sample = (c3.wavePos & 1) ? (byte & 0x0F) : (byte >> 4);
-                    int shift = c3.vol == 0 ? 4 : (c3.vol - 1);
-                    sample >>= shift;
-                    target = 15 - sample * 2;
-                } else target = 15;
-            } else target = 0;
-            int diff = target - c3.dacOutput;
-            if (diff > 4) diff = 4;
-            if (diff < -4) diff = -4;
-            c3.dacOutput += diff;
-            ch3Out = c3.dacOutput;
-        }
-
-        // Canal 4
-        {
-            int target;
-            if (c4.dacEnabled) {
-                if (c4.enabled) {
-                    int bit = ~c4.lfsr & 1;
-                    target = bit ? (15 - c4.vol * 2) : 15;
-                } else target = 15;
-            } else target = 0;
-            int diff = target - c4.dacOutput;
-            if (diff > 4) diff = 4;
-            if (diff < -4) diff = -4;
-            c4.dacOutput += diff;
-            ch4Out = c4.dacOutput;
-        }
-
-        // Routing estéreo NR51
-        int left = 0, right = 0;
-        if (nr51 & 0x10) left += ch1Out;
-        if (nr51 & 0x20) left += ch2Out;
-        if (nr51 & 0x40) left += ch3Out;
-        if (nr51 & 0x80) left += ch4Out;
-        if (nr51 & 0x01) right += ch1Out;
-        if (nr51 & 0x02) right += ch2Out;
-        if (nr51 & 0x04) right += ch3Out;
-        if (nr51 & 0x08) right += ch4Out;
-
-        // Volumen master NR50 (L y R independientes)
-        int lv = ((nr50 >> 4) & 7) + 1;
-        int rv = (nr50 & 7) + 1;
-        outL = (left * lv) * 32;
-        outR = (right * rv) * 32;
-    }
-};
-
-// ============================================================================
-// Bus
-// ============================================================================
-class Bus {
-public:
-    std::vector<uint8_t> rom;
-    std::array<uint8_t, 0x2000> vram{}, vram1{};
-    std::array<uint8_t, 0x20000> ext_ram{};
-    std::array<uint8_t, 0x2000> wram{};                         // SVBK ($FF70)                                    // SVBK ($FF70), 0 se trata como 1
-    std::array<uint8_t, 0xA0>   oam{};
-    std::array<uint8_t, 0x80>   io{};
-    std::array<uint8_t, 0x80>   hram{};
-    uint8_t ie = 0;
-
-    uint16_t romBank = 1;
-    bool    ramEnabled = false;
-    uint8_t ramBank = 0;
-    uint8_t mbcMode = 0;
-    uint8_t mbcType = 0;
-    // [v0.4] MBC3 RTC
-    bool rtcSelected = false;
-    uint8_t rtcReg = 0;
-    bool rtcLatchRequested = false;
-    uint8_t rtcRegs[5] = {0,0,0,0,0};      // S, M, H, DL, DH (valores "vivos")
-    uint8_t rtcLatched[5] = {0,0,0,0,0};   // valores capturados por latch
-    bool    rtcLatched_valid = false;
-    bool    rtcHalt = false;
-    uint32_t rtcLastUpdate = 0;            // timestamp de la última actualización
-    bool dmaActive = false;
-    int  dmaCyclesRemaining = 0;
-	    // HDMA state
-    uint16_t hdmaSrc = 0;
-    uint16_t hdmaDst = 0;
-    uint8_t  hdmaBlocksLeft = 0;
-    bool     hdmaActive = false;
-    uint8_t  hdmaBank = 0;   // ★ VRAM bank latched al iniciar HDMA/GDMA
-    // KEY1 - CGB speed switch ($FF4D)
-    uint8_t  key1Armed = 0;
-    bool     cgbDoubleSpeed = false;
-    uint8_t joypSelect = 0x30;
-    uint8_t buttonsState = 0xFF;
-    static constexpr uint8_t kButtonBit[8] = { 2, 3, 1, 0, 4, 5, 6, 7 };
-
-    uint16_t pc = 0x100;
-    uint16_t sp = 0xFFFE;
-    uint8_t a = 0x01, f = 0xB0, b = 0, c = 0, d = 0, e = 0, h = 0, l = 0;
-    bool ime = false, imeEnablePending = false, halted = false, haltBugPending = false;
-
-    uint16_t divCounter = 0;
-    uint8_t tima = 0, tma = 0, tac = 0;
-    bool timaOverflowPending = false;
-    int timaOverflowDelay = 0;
-    static constexpr std::array<int, 4> kClockSelectBit = {9, 3, 5, 7};
-
-    static constexpr uint8_t FLAG_Z = 0x80, FLAG_N = 0x40, FLAG_H = 0x20, FLAG_C = 0x10;
-    uint8_t ly = 0;
-
-    // [v0.4] APU
-    APU apu;
-
-    static constexpr uint32_t kStateMagic = 0x42574552;
-    static constexpr uint32_t kStateVersion = 4;
-	
-    void UpdateRtc() {
-        // Actualiza el RTC "vivo" basado en el tiempo real transcurrido
-        DWORD now = GetTickCount();
-        if (rtcLastUpdate == 0) { rtcLastUpdate = now; return; }
-        DWORD elapsed = now - rtcLastUpdate;
-        rtcLastUpdate = now;
-
-        if (rtcHalt) return;   // RTC detenido por bit 6 del DH
-
-        // Convertir milisegundos a segundos
-        uint32_t seconds = elapsed / 1000;
-
-        uint32_t s = rtcRegs[0];
-        uint32_t m = rtcRegs[1];
-        uint32_t h = rtcRegs[2];
-        uint32_t dl = rtcRegs[3];
-        uint32_t dh = rtcRegs[4] & 0x01;   // bit 0 del DH es el bit 8 de días
-
-        uint32_t total = s + m * 60 + h * 3600 + (dl + dh * 256) * 86400;
-        total += seconds;
-
-        // Descomponer
-        rtcRegs[0] = total % 60;
-        total /= 60;
-        rtcRegs[1] = total % 60;
-        total /= 60;
-        rtcRegs[2] = total % 24;
-        total /= 24;
-
-        // Días (pueden llegar a 511)
-        if (total > 511) total &= 0x1FF;
-        rtcRegs[3] = total & 0xFF;
-        uint8_t newDh = (rtcRegs[4] & 0xFE) | ((total >> 8) & 0x01);
-
-        // Si los días llegaron a 512, activar bit 7 (day carry)
-        if (total >= 512) newDh |= 0x80;
-        rtcRegs[4] = newDh;
-    }
-	
-    bool loadRom(const std::string& path) {
-        std::ifstream f_rom(path, std::ios::binary | std::ios::ate);
-        if (!f_rom) return false;
-        auto size = f_rom.tellg(); rom.resize((size_t)size);
-        f_rom.seekg(0); f_rom.read((char*)rom.data(), size);
-        if (rom.size() > 0x143) isCgbMode = (rom[0x143] & 0x80) != 0;
-
-        uint8_t code = (rom.size() > 0x147) ? rom[0x147] : 0;
-        if (code >= 0x19 && code <= 0x1E) mbcType = 5;
-        else if (code >= 0x0F && code <= 0x13) mbcType = 3;
-        else if (code >= 0x05 && code <= 0x06) mbcType = 2;
-        else if (code >= 0x01 && code <= 0x03) mbcType = 1;
-        else mbcType = 0;
-
-        if (isCgbMode) { a=0x11;f=0x80;b=0;c=0;d=0xFF;e=0x56;h=0;l=0x0D; }
-        else { a=0x01;f=0xB0;b=0;c=0x13;d=0;e=0xD8;h=1;l=0x4D; }
-        sp = 0xFFFE; pc = 0x0100;
-        vram.fill(0); vram1.fill(0); oam.fill(0);
-        ext_ram.fill(0); wram.fill(0); io.fill(0); hram.fill(0);
-        ie=0; ime=false; imeEnablePending=false; halted=false; haltBugPending=false;
-        divCounter=0; tima=0; tma=0; tac=0; timaOverflowPending=false; timaOverflowDelay=0;
-        romBank=1; ramEnabled=false; ramBank=0; mbcMode=0;
-        rtcSelected=false; rtcReg=0; rtcLatchRequested=false;
-        for(int i=0;i<5;++i) { rtcRegs[i]=0; rtcLatched[i]=0; }
-        rtcLatched_valid = false;
-        rtcHalt = false;
-        rtcLastUpdate = GetTickCount();
-        dmaActive=false; dmaCyclesRemaining=0;
-        hdmaSrc=0; hdmaDst=0; hdmaBlocksLeft=0; hdmaActive=false;
-		hdmaBank = 0;
-		key1Armed=0; cgbDoubleSpeed=false;
-        joypSelect=0x30; buttonsState=0xFF;
-        lcdc=0x91; stat=0x82; scy=0; scx=0; lyc=0; wy=0; wx=0;
-        bgp=0xFC; obp0=0xFF; obp1=0xFF; vbk=0; bcps=0; ocps=0;
-// ★ Inicializar paletas a blanco (como el boot ROM de CGB)
-for (int i = 0; i < 64; i += 2) {
-    bgPaletteRam[i]     = 0xFF;   // byte bajo de blanco (0x7FFF)
-    bgPaletteRam[i + 1] = 0x7F;   // byte alto
-    objPaletteRam[i]     = 0xFF;
-    objPaletteRam[i + 1] = 0x7F;
-}
-        ppuModeCycles=0; ly=0; windowInternalLine=0;
-        apu.reset();
-        return true;
-    }
-
-    uint8_t vbk = 0;
-    uint8_t lcdc=0x91, stat=0x82, scy=0, scx=0, lyc=0, wy=0, wx=0;
-    uint8_t bgp=0xFC, obp0=0xFF, obp1=0xFF;
-    bool isCgbMode = false;
-    std::array<uint8_t, 64> bgPaletteRam{}, objPaletteRam{};
-    uint8_t bcps=0, ocps=0;
-    int ppuModeCycles = 0;
-    int windowInternalLine = 0;
-
-    uint8_t readVram(int bank, uint16_t off) { return bank==0 ? vram[off] : vram1[off]; }
-
-    static uint16_t rgb555(uint8_t lo, uint8_t hi) { return lo | ((uint16_t)hi << 8); }
-    static uint32_t rgb555ToArgb(uint16_t c) {
-        uint8_t r=c&0x1F,g=(c>>5)&0x1F,b2=(c>>10)&0x1F;
-        auto ex=[](uint8_t v){ return (uint8_t)((v<<3)|(v>>2)); };
-        return ((uint32_t)ex(r)<<16)|((uint32_t)ex(g)<<8)|(uint32_t)ex(b2);
-    }
-    static uint32_t dmgShade(uint8_t i) {
-        static const uint32_t t[4]={0x00E0F8D0,0x0088C070,0x00346856,0x00081820};
-        return t[i&3];
-    }
-
-    uint8_t ppuReadReg(uint16_t addr) {
-        switch(addr) {
-            case 0xFF40: return lcdc;
-            case 0xFF41: return stat|0x80;
-            case 0xFF42: return scy;
-            case 0xFF43: return scx;
-            case 0xFF44: return ly;
-            case 0xFF45: return lyc;
-            case 0xFF47: return bgp;
-            case 0xFF48: return obp0;
-            case 0xFF49: return obp1;
-            case 0xFF4A: return wy;
-            case 0xFF4B: return wx;
-            case 0xFF4F: return vbk|0xFE;
-            case 0xFF68: return bcps|0x40;
-            case 0xFF69: return bgPaletteRam[bcps&0x3F];
-            case 0xFF6A: return ocps|0x40;
-            case 0xFF6B: return objPaletteRam[ocps&0x3F];
-        }
-        return 0xFF;
-    }
-
-    void ppuWriteReg(uint16_t addr, uint8_t val) {
-        switch(addr) {
-            case 0xFF40: lcdc=val; return;
-            case 0xFF41: stat=(stat&0x07)|(val&0xF8); return;
-            case 0xFF42: scy=val; return;
-            case 0xFF43: scx=val; return;
-            case 0xFF44: return;
-            case 0xFF45: lyc=val; return;
-            case 0xFF46: {
-                uint16_t src=(uint16_t)val<<8;
-                for(int i=0;i<0xA0;++i) oam[i]=readByte(src+i);
-                dmaActive=true; dmaCyclesRemaining=640; return;
-            }
-            case 0xFF47: bgp=val; return;
-            case 0xFF48: obp0=val; return;
-            case 0xFF49: obp1=val; return;
-            case 0xFF4A: wy=val; return;
-            case 0xFF4B: wx=val; return;
-            case 0xFF4F: vbk=val&1; return;
-            case 0xFF68: bcps=val&0xBF; return;
-            case 0xFF69: bgPaletteRam[bcps&0x3F]=val; if(bcps&0x80) bcps=0x80|((bcps+1)&0x3F); return;
-            case 0xFF6A: ocps=val&0xBF; return;
-            case 0xFF6B: objPaletteRam[ocps&0x3F]=val; if(ocps&0x80) ocps=0x80|((ocps+1)&0x3F); return;
-        }
-    }
-
-    static constexpr int kOamSearchCycles = 80;
-    static constexpr int kPixelTransferCycles = 172;
-    static constexpr int kHblankCycles = 456 - kOamSearchCycles - kPixelTransferCycles;
-
-    void stepPpu(int t) {
-        if(!(lcdc&0x80)){ly=0;ppuModeCycles=0;stat&=0xFC;windowInternalLine=0;return;}
-        ppuModeCycles += t;
-        int mode = stat&3;
-        if(ly<144) {
-            if(mode==2 && ppuModeCycles>=kOamSearchCycles){ppuModeCycles-=kOamSearchCycles;setMode(3);}
-            else if(mode==3 && ppuModeCycles>=kPixelTransferCycles){
-                ppuModeCycles-=kPixelTransferCycles;renderScanline();setMode(0);
-
-                // ★ HDMA: copiar 16 bytes AL INICIO del HBlank
-                if (hdmaActive && hdmaBlocksLeft > 0) {
-                    uint16_t dstBase = 0x8000 | (hdmaDst & 0x1FF0);
-                    for (int i = 0; i < 16; ++i) {
-                        uint8_t b = readByte(hdmaSrc + i);
-                        uint16_t addr = dstBase + i;
-                        if (addr >= 0xA000) addr -= 0x2000;
-                        if (hdmaBank) vram1[addr - 0x8000] = b;
-                        else          vram[addr - 0x8000] = b;
-                    }
-                    hdmaSrc += 16;
-                    hdmaDst += 16;
-                    hdmaBlocksLeft--;
-                    if (hdmaBlocksLeft == 0) {
-                        hdmaActive = false;
-                        io[0x55] = 0xFF;
-                    } else {
-                        io[0x55] = (hdmaBlocksLeft - 1) & 0x7F;
-                    }
-                }
-            } else if(mode==0 && ppuModeCycles>=kHblankCycles){
-                ppuModeCycles-=kHblankCycles; advanceLine();
-                if(ly==144){setMode(1);requestInterrupt(0x01);} else setMode(2);
-            }
-        } else {
-            if(ppuModeCycles>=456){ppuModeCycles-=456;advanceLine();if(ly==0){setMode(2);windowInternalLine=0;}}
-        }
-    }
-    void setMode(int m){stat=(stat&0xFC)|m;bool w=false;if(m==0&&(stat&8))w=true;if(m==2&&(stat&0x20))w=true;if(m==1&&(stat&0x10))w=true;if(w)requestInterrupt(0x02);}
-    void advanceLine(){ly++;if(ly>153)ly=0;bool co=(ly==lyc);if(co){stat|=0x04;if(stat&0x40)requestInterrupt(0x02);}else stat&=~0x04;}
-
-    void renderScanline() {
-        if(ly>=144) return;
-        uint8_t bgi[GB_WIDTH]={0};
-        renderBGWindow(bgi);
-        if(lcdc&0x02) renderSprites(bgi);
-    }
-
-    void renderBGWindow(uint8_t* out) {
-        bool bgEn = isCgbMode ? true : (lcdc&0x01)!=0;
-        bool winEn = (lcdc&0x20)!=0 && (lcdc&0x01)!=0 && wy<=ly && wx<=166;
-        for(int x=0;x<GB_WIDTH;++x){
-            bool useWin = winEn && x>=(int(wx)-7);
-            uint16_t mapBase = useWin ? ((lcdc&0x40)?0x9C00:0x9800) : ((lcdc&0x08)?0x9C00:0x9800);
-            int px = useWin ? (x-(int(wx)-7)) : ((x+scx)&0xFF);
-            int py = useWin ? (windowInternalLine&0xFF) : ((ly+scy)&0xFF);
-            int col=px/8,row=py/8;
-            uint16_t mapAddr = mapBase + row*32 + col;
-            uint8_t ti = readVram(0, mapAddr-0x8000);
-            uint8_t at = isCgbMode ? readVram(1, mapAddr-0x8000) : 0;
-            int tb = isCgbMode ? ((at>>3)&1) : 0;
-            bool xf = isCgbMode && (at&0x20);
-            bool yf = isCgbMode && (at&0x40);
-            bool pri = isCgbMode && (at&0x80);
-            int pal = at&7;
-            int rowIn = yf ? (7-(py%8)) : (py%8);
-            uint16_t td;
-            if(lcdc&0x10) td = 0x8000 + (uint16_t)ti*16;
-            else td = 0x9000 + (int16_t)(int8_t)ti*16;
-            td += rowIn*2;
-            uint8_t lo = readVram(tb, td-0x8000);
-            uint8_t hi = readVram(tb, td-0x8000+1);
-            int bi = xf ? (px%8) : (7-(px%8));
-            int ci = (((hi>>bi)&1)<<1) | ((lo>>bi)&1);
-            out[x] = (uint8_t)(ci | (pri?0x80:0));
-            uint32_t argb;
-            if(isCgbMode){
-                int po = pal*8 + ci*2;
-                argb = rgb555ToArgb(rgb555(bgPaletteRam[po], bgPaletteRam[po+1]));
-            } else {
-                int sh = (bgp>>(ci*2))&3;
-                argb = bgEn ? dmgShade(sh) : dmgShade(0);
-            }
-            g_screenBuffer[ly*GB_WIDTH+x] = argb;
-        }
-        if(winEn) windowInternalLine++;
-    }
-
-    void renderSprites(uint8_t* bgi) {
-        bool tall = (lcdc&0x04)!=0;
-        int h = tall?16:8;
-        struct E{int idx;uint8_t y,x,t,a;};
-        std::vector<E> f;
-        for(int i=0;i<40 && f.size()<10;++i){
-            uint8_t sy=oam[i*4+0],sx=oam[i*4+1],t=oam[i*4+2],at=oam[i*4+3];
-            int top=(int)sy-16;
-            if(ly>=top && ly<top+h) f.push_back({i,sy,sx,t,at});
-        }
-        if(!isCgbMode){
-            std::stable_sort(f.begin(),f.end(),[](const E&a2,const E&b2){return a2.x<b2.x;});
-        }
-        for(auto it=f.rbegin(); it!=f.rend(); ++it){
-            const E&s=*it;
-            bool xf=s.a&0x20, yf=s.a&0x40;
-            bool behind=s.a&0x80;
-            int cb=isCgbMode?((s.a>>3)&1):0;
-            int cp=s.a&7;
-            int dp=(s.a&0x10)?1:0;
-            int top=(int)s.y-16;
-            int row=ly-top;
-            if(yf) row=h-1-row;
-            uint8_t ti=tall?(s.t&0xFE):s.t;
-            if(tall && row>=8){ti|=1;row-=8;}
-            uint16_t td=0x8000+(uint16_t)ti*16+row*2;
-            uint8_t lo=readVram(cb,td-0x8000), hi=readVram(cb,td-0x8000+1);
-            for(int p=0;p<8;++p){
-                int sx2=(int)s.x-8+p;
-                if(sx2<0||sx2>=GB_WIDTH) continue;
-                int bi=xf?p:(7-p);
-                int ci=(((hi>>bi)&1)<<1)|((lo>>bi)&1);
-                if(ci==0) continue;
-                uint8_t bh=bgi[sx2]&0x3F;
-                bool bp=(bgi[sx2]&0x80)!=0;
-                if(behind && bh!=0) continue;
-                if(isCgbMode && bp && (lcdc&0x01) && bh!=0) continue;
-                uint32_t argb;
-                if(isCgbMode){int po=cp*8+ci*2;argb=rgb555ToArgb(rgb555(objPaletteRam[po],objPaletteRam[po+1]));}
-                else {uint8_t pl=dp?obp1:obp0;int sh=(pl>>(ci*2))&3;argb=dmgShade(sh);}
-                g_screenBuffer[ly*GB_WIDTH+sx2]=argb;
-            }
-        }
-    }
-
-    uint8_t readJoypad() const {
-        uint8_t r=(joypSelect&0x30)|0xC0;
-        uint8_t ln=0x0F;
-        if(!(joypSelect&0x10)) ln &= (buttonsState&0x0F);
-        if(!(joypSelect&0x20)) ln &= ((buttonsState>>4)&0x0F);
-        return r|ln;
-    }
-    void setButton(int idx, bool p) {
-        if(idx<0||idx>7) return;
-        uint8_t b=kButtonBit[idx];
-        bool wr=((buttonsState>>b)&1)!=0;
-        if(p) buttonsState&=~(1u<<b); else buttonsState|=(1u<<b);
-        if(p&&wr) requestInterrupt(0x10);
-    }
-    void releaseAllButtons() { buttonsState=0xFF; }
-
-    // --- MBC1 real bank-select helper ---
-    // The 2-bit secondary register ($4000-$5FFF, stored in `ramBank` for
-    // MBC1) ALWAYS combines with the 5-bit primary register to form the
-    // effective ROM bank for the $4000-$7FFF window, regardless of mode.
-    // `mbcMode` only decides whether that same 2-bit register ALSO banks
-    // the normally-fixed $0000-$3FFF region and selects the RAM bank
-    // (mode 1), or is dedicated purely to ROM bank extension with RAM
-    // always on bank 0 and $0000-$3FFF fixed to bank 0 (mode 0).
-    uint16_t mbc1EffectiveHighBank() const { return (uint16_t)(romBank & 0x1F) | ((uint16_t)(ramBank & 0x03) << 5); }
-
-    uint8_t readByte(uint16_t addr) {
-        if(addr<=0x3FFF) {
-            if (mbcType==1 && mbcMode==1) { // mode 1: upper bits also bank the low region
-                size_t e=(size_t)((ramBank&0x03)<<5)*0x4000+addr;
-                return e<rom.size()?rom[e]:0xFF;
-            }
-            return addr<rom.size()?rom[addr]:0xFF;
-        }
-        if(addr<=0x7FFF){
-            size_t bank = (mbcType==1) ? mbc1EffectiveHighBank() : romBank;
-            size_t e=bank*0x4000+(addr-0x4000);return e<rom.size()?rom[e]:0xFF;
-        }
-        if(addr>=0x8000&&addr<=0x9FFF){if(dmaActive)return 0xFF;if((stat&3)==3)return 0xFF;return vbk?vram1[addr-0x8000]:vram[addr-0x8000];}
-        if(addr>=0xA000&&addr<=0xBFFF){
-            if(dmaActive) return 0xFF;
-            if(!ramEnabled) return 0xFF;
-            if(rtcSelected) {
-                // ★ Leer del RTC: si hay latch válido, devolver latched
-                uint8_t reg = rtcReg & 0x07;
-                if (reg >= 5) return 0xFF;
-                if (rtcLatched_valid) return rtcLatched[reg];
-                UpdateRtc();
-                return rtcRegs[reg];
-            }
-            uint8_t effectiveRamBank = (mbcType==1 && mbcMode==0) ? 0 : (ramBank & 0x0F);
-            return ext_ram[effectiveRamBank*0x2000+(addr-0xA000)];
-        }
-        if(addr>=0xC000&&addr<=0xDFFF){if(dmaActive)return 0xFF;return wram[addr-0xC000];}
-        if(addr>=0xE000&&addr<=0xFDFF) return readByte(addr-0x2000);
-        if(addr>=0xFE00&&addr<=0xFE9F){if(dmaActive)return 0xFF;int m=stat&3;if(m==2||m==3)return 0xFF;return oam[addr-0xFE00];}
-        if(addr>=0xFEA0&&addr<=0xFEFF) return 0xFF;
-        if(addr==0xFF00) return readJoypad();
-        if(addr>=0xFF10 && addr<=0xFF3F) {
-            // ★ DMG: acceso restringido a wave RAM durante reproducción
-            if (addr >= 0xFF30 && addr <= 0xFF3F && !isCgbMode && apu.c3.enabled) {
-                uint8_t curByte = (apu.c3.wavePos >> 1) & 15;
-                if ((addr - 0xFF30) != curByte) return 0xFF;
-            }
-            return apu.readReg(addr);
-        }
-        if(addr==0xFF04) return (uint8_t)(divCounter>>8);
-        if(addr==0xFF05) return timaOverflowPending?0x00:tima;
-        if(addr==0xFF06) return tma;
-        if(addr==0xFF07) return tac|0xF8;
-        if(addr==0xFF0F) return (uint8_t)(io[0x0F]|0xE0);
-        if(addr==0xFF44) return ly;
-        if (addr == 0xFF55) return hdmaActive ? ((hdmaBlocksLeft - 1) & 0x7F) : 0xFF;
-        if (addr == 0xFF4D) {
-            uint8_t r = 0x7E;
-            if (cgbDoubleSpeed) r |= 0x80;
-            r |= key1Armed;
-            return r;
-        }
-        if((addr>=0xFF40&&addr<=0xFF4B)||addr==0xFF4F||addr==0xFF68||addr==0xFF69||addr==0xFF6A||addr==0xFF6B) return ppuReadReg(addr);
-        if(addr>=0xFF00&&addr<=0xFF7F) return io[addr-0xFF00];
-        if(addr>=0xFF80&&addr<=0xFFFE) return hram[addr-0xFF80];
-        if(addr==0xFFFF) return (uint8_t)(ie|0xE0);
-        return 0xFF;
-    }
-
-    void writeByte(uint16_t addr, uint8_t val) {
-        if(addr<=0x1FFF){ramEnabled=(val&0x0F)==0x0A;return;}
-        if(addr>=0x2000&&addr<=0x3FFF){
-            if(mbcType==5){
-                if(addr<=0x2FFF) romBank=(romBank&0x100)|(uint16_t)val;
-                else romBank=(romBank&0x0FF)|((uint16_t)(val&1)<<8);
-            } else if(mbcType==3){
-                uint8_t b=val&0x7F; if(b==0)b=1; romBank=b;
-            } else {
-                uint8_t b=val&0x1F; if(b==0)b=1; romBank=b;
-            }
-            return;
-        }
-        if(addr>=0x4000&&addr<=0x5FFF){
-            if(mbcType==3){
-                if(val<=0x07){ramBank=val; rtcSelected=false;}
-                else if(val>=0x08&&val<=0x0C){rtcSelected=true; rtcReg=val-0x08; ramBank=0;}
-            } else if(mbcType==5){ramBank=val&0x0F; rtcSelected=false;}
-            else {ramBank=val&0x03; rtcSelected=false;}
-            return;
-        }
-        if(addr>=0x6000&&addr<=0x7FFF){
-            if(mbcType==3){
-                if(val==0x00) rtcLatchRequested=true;
-                else if(val==0x01 && rtcLatchRequested){
-                    rtcLatchRequested=false;
-                    // ★ Latch: copiar valores vivos a latched
-                    UpdateRtc();
-                    for(int i=0;i<5;++i) rtcLatched[i] = rtcRegs[i];
-                    rtcLatched_valid = true;
-                }
-            }
-            mbcMode=val&0x01;
-            return;
-        }
-        if(addr>=0x8000&&addr<=0x9FFF){
-            if(dmaActive) return;
-            if((stat&3)==3) return;
-            if(vbk) vram1[addr-0x8000]=val; else vram[addr-0x8000]=val;
-            return;
-        }
-        if(addr>=0xA000&&addr<=0xBFFF){
-            if(dmaActive) return;
-            if(!ramEnabled) return;
-            if(rtcSelected) {
-                // ★ Escribir al RTC (register $08-$0C)
-                UpdateRtc();
-                uint8_t reg = rtcReg & 0x07;
-                if (reg < 5) {
-                    if (reg == 4) {
-                        // DH: bit 6 = halt, bit 0 = day high
-                        rtcHalt = (val & 0x40) != 0;
-                        rtcRegs[4] = (rtcRegs[4] & 0xBE) | (val & 0x41);
-                    } else {
-                        rtcRegs[reg] = val;
-                    }
-                }
-                return;
-            }
-            uint8_t effectiveRamBank = (mbcType==1 && mbcMode==0) ? 0 : (ramBank & 0x0F);
-            ext_ram[effectiveRamBank*0x2000+(addr-0xA000)]=val;
-            return;
-        }
-		if(addr>=0xC000&&addr<=0xDFFF){if(dmaActive)return;wram[addr-0xC000]=val;return;}
-        if(addr>=0xE000&&addr<=0xFDFF){writeByte(addr-0x2000,val);return;}
-        if(addr>=0xFEA0&&addr<=0xFEFF) return;
-        if(addr==0xFF01){io[1]=val;return;}
-        if(addr==0xFF02){io[2]=val;if(val&0x80){io[2]&=0x7F;requestInterrupt(0x08);}return;}
-        if(addr>=0xFF10 && addr<=0xFF3F){
-            // ★ DMG: acceso restringido a wave RAM durante reproducción
-            if (addr >= 0xFF30 && addr <= 0xFF3F && !isCgbMode && apu.c3.enabled) {
-                uint8_t curByte = (apu.c3.wavePos >> 1) & 15;
-                if ((addr - 0xFF30) != curByte) return;
-            }
-            apu.writeReg(addr,val);
-            return;
-        }
-        if(addr==0xFF04){bool o=timerInputSignal();divCounter=0;bool n=timerInputSignal();if(o&&!n)incrementTimerOnFallingEdge();return;}
-        if(addr==0xFF05){if(timaOverflowPending){timaOverflowPending=false;timaOverflowDelay=0;}tima=val;return;}
-        if(addr==0xFF06){tma=val;return;}
-        if(addr==0xFF07){bool o=timerInputSignal();tac=val&0x07;bool n=timerInputSignal();if(o&&!n)incrementTimerOnFallingEdge();return;}
-        if(addr==0xFF0F){io[0x0F]=val&0x1F;return;}
-        if(addr==0xFF44) return;
-        // ★ HDMA registers
-        if (addr == 0xFF51) { hdmaSrc = (hdmaSrc & 0x00FF) | (val << 8); return; }
-        if (addr == 0xFF4D) {
-            if (isCgbMode) key1Armed = val & 1;
-            return;
-        }
-        if (addr == 0xFF52) { hdmaSrc = (hdmaSrc & 0xFF00) | (val & 0xF0); return; }
-        if (addr == 0xFF53) { hdmaDst = (hdmaDst & 0x00FF) | ((val & 0x1F) << 8); hdmaDst |= 0x8000; return; }
-        if (addr == 0xFF54) { hdmaDst = (hdmaDst & 0xFF00) | (val & 0xF0); return; }
-        if (addr == 0xFF55) {
-            if (!(val & 0x80)) {
-                // GDMA o cancelar HDMA
-                if (hdmaActive) {
-                    // Cancelar HDMA: bit 7 = 1 al leer, lower 7 = bloques restantes - 1
-                    hdmaActive = false;
-                    io[0x55] = 0x80 | ((hdmaBlocksLeft - 1) & 0x7F);
-                } else {
-                    // GDMA: copiar todo de una vez
-                    int blocks = (val & 0x7F) + 1;
-                    uint16_t dstBase = 0x8000 | (hdmaDst & 0x1FF0);
-                    uint8_t bank = vbk;   // ★ latch al iniciar
-                    for (int i = 0; i < blocks * 16; ++i) {
-                        uint8_t b = readByte(hdmaSrc + i);
-                        uint16_t a = dstBase + i;
-                        if (a >= 0xA000) a -= 0x2000;   // wrap dentro de VRAM
-                        if (bank) vram1[a - 0x8000] = b;
-                        else      vram[a - 0x8000] = b;
-                    }
-                    io[0x55] = 0xFF;
-                }
-            } else {
-                // HDMA: iniciar (si ya está activa, ignorar)
-                if (!hdmaActive) {
-                    hdmaBank = vbk;   // ★ latch del banco
-                    hdmaActive = true;
-                    hdmaBlocksLeft = (val & 0x7F) + 1;
-                    io[0x55] = (hdmaBlocksLeft - 1) & 0x7F;
-                }
-            }
-            return;
-        }
-        if((addr>=0xFF40&&addr<=0xFF46)||(addr>=0xFF47&&addr<=0xFF4B)||addr==0xFF4F||addr==0xFF68||addr==0xFF69||addr==0xFF6A||addr==0xFF6B){ppuWriteReg(addr,val);return;}
-		if(addr==0xFF00){joypSelect=val&0x30;return;}
-        if(addr>=0xFF00&&addr<=0xFF7F){io[addr-0xFF00]=val;return;}
-        if(addr>=0xFF80&&addr<=0xFFFE){hram[addr-0xFF80]=val;return;}
-        if(addr==0xFFFF){ie=val&0x1F;return;}
-    }
-
-    void requestInterrupt(uint8_t bit){io[0x0F]|=bit;}
-    void setFlag(uint8_t m,bool v){if(v)f|=m;else f&=~m;f&=0xF0;}
-    bool getFlag(uint8_t m) const {return (f&m)!=0;}
-    uint16_t bc() const {return ((uint16_t)b<<8)|c;}
-    uint16_t de() const {return ((uint16_t)d<<8)|e;}
-    uint16_t hl() const {return ((uint16_t)h<<8)|l;}
-    void setBc(uint16_t v){b=v>>8;c=v&0xFF;}
-    void setDe(uint16_t v){d=v>>8;e=v&0xFF;}
-    void setHl(uint16_t v){h=v>>8;l=v&0xFF;}
-
-    uint8_t getR(int i){switch(i){case 0:return b;case 1:return c;case 2:return d;case 3:return e;case 4:return h;case 5:return l;case 6:return readByte(hl());default:return a;}}
-    void setR(int i,uint8_t v){switch(i){case 0:b=v;break;case 1:c=v;break;case 2:d=v;break;case 3:e=v;break;case 4:h=v;break;case 5:l=v;break;case 6:writeByte(hl(),v);break;default:a=v;break;}}
-
-    uint8_t fetch8(){uint8_t v=readByte(pc);if(haltBugPending)haltBugPending=false;else pc++;return v;}
-    uint16_t fetch16(){uint8_t lo=fetch8(),hi=fetch8();return ((uint16_t)hi<<8)|lo;}
-    void push16(uint16_t v){sp-=2;writeByte(sp,v&0xFF);writeByte(sp+1,v>>8);}
-    uint16_t pop16(){uint16_t v=readByte(sp)|((uint16_t)readByte(sp+1)<<8);sp+=2;return v;}
-
-    void aluAdd(uint8_t v,bool c){int cy=(c&&getFlag(FLAG_C))?1:0;int r=a+v+cy;setFlag(FLAG_H,((a&0xF)+(v&0xF)+cy)>0xF);setFlag(FLAG_C,r>0xFF);a=(uint8_t)r;setFlag(FLAG_Z,a==0);setFlag(FLAG_N,false);}
-    void aluSub(uint8_t v,bool c,bool s){int cy=(c&&getFlag(FLAG_C))?1:0;int r=a-v-cy;setFlag(FLAG_H,((a&0xF)-(v&0xF)-cy)<0);setFlag(FLAG_C,r<0);uint8_t r8=(uint8_t)r;setFlag(FLAG_Z,r8==0);setFlag(FLAG_N,true);if(s)a=r8;}
-    void aluAnd(uint8_t v){a&=v;setFlag(FLAG_Z,a==0);setFlag(FLAG_N,false);setFlag(FLAG_H,true);setFlag(FLAG_C,false);}
-    void aluXor(uint8_t v){a^=v;setFlag(FLAG_Z,a==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);setFlag(FLAG_C,false);}
-    void aluOr(uint8_t v){a|=v;setFlag(FLAG_Z,a==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);setFlag(FLAG_C,false);}
-    uint8_t incVal(uint8_t v){setFlag(FLAG_H,(v&0xF)==0xF);v++;setFlag(FLAG_Z,v==0);setFlag(FLAG_N,false);return v;}
-    uint8_t decVal(uint8_t v){setFlag(FLAG_H,(v&0xF)==0);v--;setFlag(FLAG_Z,v==0);setFlag(FLAG_N,true);return v;}
-    uint8_t rlc(uint8_t v){bool c2=v&0x80;v=(v<<1)|(c2?1:0);setFlag(FLAG_C,c2);setFlag(FLAG_Z,v==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);return v;}
-    uint8_t rrc(uint8_t v){bool c2=v&1;v=(v>>1)|(c2?0x80:0);setFlag(FLAG_C,c2);setFlag(FLAG_Z,v==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);return v;}
-    uint8_t rl(uint8_t v){bool oc=getFlag(FLAG_C);bool nc=v&0x80;v=(v<<1)|(oc?1:0);setFlag(FLAG_C,nc);setFlag(FLAG_Z,v==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);return v;}
-    uint8_t rr(uint8_t v){bool oc=getFlag(FLAG_C);bool nc=v&1;v=(v>>1)|(oc?0x80:0);setFlag(FLAG_C,nc);setFlag(FLAG_Z,v==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);return v;}
-    uint8_t sla(uint8_t v){bool c2=v&0x80;v<<=1;setFlag(FLAG_C,c2);setFlag(FLAG_Z,v==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);return v;}
-    uint8_t sra(uint8_t v){bool c2=v&1;v=(v>>1)|(v&0x80);setFlag(FLAG_C,c2);setFlag(FLAG_Z,v==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);return v;}
-    uint8_t srl(uint8_t v){bool c2=v&1;v>>=1;setFlag(FLAG_C,c2);setFlag(FLAG_Z,v==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);return v;}
-    uint8_t swap(uint8_t v){v=(v<<4)|(v>>4);setFlag(FLAG_Z,v==0);setFlag(FLAG_N,false);setFlag(FLAG_H,false);setFlag(FLAG_C,false);return v;}
-
-    static constexpr std::array<uint16_t,5> kVectors={0x0040,0x0048,0x0050,0x0058,0x0060};
-
-    int dispatchInterrupt(uint8_t p){
-        for(int b=0;b<5;++b){
-            if(p&(1u<<b)){
-                ime=false;io[0x0F]&=~(1u<<b);push16(pc);pc=kVectors[b];return 20;
-            }
-        }
-        return 0;
-    }
-
-    bool timerInputSignal() const {if(!(tac&0x04))return false;return ((divCounter>>kClockSelectBit[tac&3])&1)!=0;}
-    void incrementTimerOnFallingEdge(){if(timaOverflowPending)return;uint8_t o=tima;tima=(uint8_t)(tima+1);if(o==0xFF){tima=0;timaOverflowPending=true;timaOverflowDelay=4;}}
-    void stepTimer(int t){
-        if (t <= 0) return;
-
-        // 1) Procesar overflow pendiente de TIMA
-        if (timaOverflowPending) {
-            if (t <= timaOverflowDelay) {
-                timaOverflowDelay -= t;
-                divCounter += (uint16_t)t;
-                return;
-            }
-            // Avanzar DIV por el delay consumido
-            divCounter += (uint16_t)timaOverflowDelay;
-            t -= timaOverflowDelay;
-            timaOverflowDelay = 0;
-            tima = tma;
-            requestInterrupt(0x04);
-            timaOverflowPending = false;
-        }
-
-        // 2) Timer desactivado: solo avanzar DIV
-        if (!(tac & 0x04)) {
-            divCounter += (uint16_t)t;
-            return;
-        }
-
-        // 3) Calcular cuántos flancos caen en los t ciclos
-        int bit = kClockSelectBit[tac & 3];
-        int period = 1 << bit;
-        int phase = divCounter & (period - 1);
-        int firstEdge = period - phase;
-
-        if (t < firstEdge) {
-            divCounter += (uint16_t)t;
-            return;
-        }
-
-        // Primera caída
-        divCounter += (uint16_t)firstEdge;
-        t -= firstEdge;
-        {
-            uint8_t oldTima = tima;
-            tima = (uint8_t)(tima + 1);
-            if (oldTima == 0xFF) {
-                tima = 0;
-                timaOverflowPending = true;
-                timaOverflowDelay = 4;
-                divCounter += (uint16_t)(t % period);
-                return;
-            }
-        }
-
-        // Caídas siguientes
-        int edges = t / period;
-        int remainder = t % period;
-
-        for (int e = 0; e < edges; ++e) {
-            uint8_t oldTima = tima;
-            tima = (uint8_t)(tima + 1);
-            if (oldTima == 0xFF) {
-                tima = 0;
-                timaOverflowPending = true;
-                timaOverflowDelay = 4;
-                divCounter += (uint16_t)remainder;
-                return;
-            }
-        }
-
-        divCounter += (uint16_t)remainder;
-    }
-    void tickDma(int t){if(!dmaActive)return;dmaCyclesRemaining-=t;if(dmaCyclesRemaining<=0){dmaActive=false;dmaCyclesRemaining=0;}}
-
-    int step() {
-        if (rom.empty()) return 0;
-
-        // En double-speed, CPU/Timer/OAM-DMA corren 2×; PPU/HDMA/APU a velocidad normal
-        int speedMult = cgbDoubleSpeed ? 2 : 1;
-
-        if (halted) {
-            uint8_t p = ie & io[0x0F] & 0x1F;
-            if (p) halted = false;
-            stepTimer(4 * speedMult);
-            stepPpu(4);
-            tickDma(4 * speedMult);
-            return 4;
-        }
-
-        if (ime) {
-            uint8_t p = ie & io[0x0F] & 0x1F;
-            if (p) {
-                int t = dispatchInterrupt(p);          // T-cycles reales de la instrucción
-                int realDots = t / speedMult;          // dots reales consumidos
-                if (realDots < 1) realDots = 1;
-                stepTimer(realDots * speedMult);       // timer va 2× en double-speed
-                stepPpu(realDots);                     // PPU a velocidad normal
-                tickDma(realDots * speedMult);         // OAM DMA va 2× en double-speed
-                return realDots;
-            }
-        }
-
-        bool en = imeEnablePending;
-        uint8_t op = fetch8();
-        int t = execute(op);
-
-        int realDots = t / speedMult;
-        if (realDots < 1) realDots = 1;
-
-        stepTimer(realDots * speedMult);
-        stepPpu(realDots);
-        tickDma(realDots * speedMult);
-
-        if (en) { ime = true; imeEnablePending = false; }
-        return realDots;
-    }
-
-    int execute(uint8_t op) {
-        if(op>=0x40&&op<=0x7F&&op!=0x76){int d=(op>>3)&7,s=op&7;setR(d,getR(s));return (d==6||s==6)?8:4;}
-        if(op==0x76){bool p=(ie&readByte(0xFF0F)&0x1F)!=0;if(!ime&&p){haltBugPending=true;halted=false;}else halted=true;return 4;}
-        if(op>=0x80&&op<=0xBF){int ao=(op>>3)&7,s=op&7;uint8_t v=getR(s);switch(ao){case 0:aluAdd(v,false);break;case 1:aluAdd(v,true);break;case 2:aluSub(v,false,true);break;case 3:aluSub(v,true,true);break;case 4:aluAnd(v);break;case 5:aluXor(v);break;case 6:aluOr(v);break;case 7:aluSub(v,false,false);break;}return s==6?8:4;}
-        if((op&0xC7)==0x06){int d=(op>>3)&7;uint8_t n=fetch8();setR(d,n);return d==6?12:8;}
-        if((op&0xC7)==0x04){int r=(op>>3)&7;setR(r,incVal(getR(r)));return r==6?12:4;}
-        if((op&0xC7)==0x05){int r=(op>>3)&7;setR(r,decVal(getR(r)));return r==6?12:4;}
-        switch(op){
-            case 0x00:return 4;
-            case 0x10: {
-                if (isCgbMode && (key1Armed & 1)) {
-                    cgbDoubleSpeed = !cgbDoubleSpeed;
-                    key1Armed = 0;
-                    fetch8();
-                    // El pause es siempre 8200 dots (2050 M-cycles × 4 T-cycles)
-                    // En double-speed cada dot dura la mitad, pero el hardware
-                    // mantiene el pause en 8200 dots = 4100 "fast M-cycles"
-                    return cgbDoubleSpeed ? 4100 : 8200;
-                }
-                fetch8();
-                return 4;
-            }
-            case 0xF3:ime=false;imeEnablePending=false;return 4;
-            case 0xFB:if(!ime)imeEnablePending=true;return 4;
-            case 0x27:{int adj=0;bool setC=getFlag(FLAG_C);if(getFlag(FLAG_N)){if(getFlag(FLAG_H))adj+=0x06;if(getFlag(FLAG_C))adj+=0x60;a=(uint8_t)(a-adj);}else{if(getFlag(FLAG_H)||(a&0xF)>9)adj+=0x06;if(getFlag(FLAG_C)||a>0x99){adj+=0x60;setC=true;}a=(uint8_t)(a+adj);}setFlag(FLAG_Z,a==0);setFlag(FLAG_H,false);setFlag(FLAG_C,setC);return 4;}
-            case 0x2F:a=~a;setFlag(FLAG_N,true);setFlag(FLAG_H,true);return 4;
-            case 0x37:setFlag(FLAG_N,false);setFlag(FLAG_H,false);setFlag(FLAG_C,true);return 4;
-            case 0x3F:setFlag(FLAG_N,false);setFlag(FLAG_H,false);setFlag(FLAG_C,!getFlag(FLAG_C));return 4;
-            case 0x07:a=rlc(a);setFlag(FLAG_Z,false);return 4;
-            case 0x0F:a=rrc(a);setFlag(FLAG_Z,false);return 4;
-            case 0x17:a=rl(a);setFlag(FLAG_Z,false);return 4;
-            case 0x1F:a=rr(a);setFlag(FLAG_Z,false);return 4;
-            case 0x01:setBc(fetch16());return 12;
-            case 0x11:setDe(fetch16());return 12;
-            case 0x21:setHl(fetch16());return 12;
-            case 0x31:sp=fetch16();return 12;
-            case 0x08:{uint16_t addr=fetch16();writeByte(addr,sp&0xFF);writeByte(addr+1,sp>>8);return 20;}
-            case 0xF9:sp=hl();return 8;
-            case 0xF8:{int8_t d=(int8_t)fetch8();int r=sp+d;setFlag(FLAG_Z,false);setFlag(FLAG_N,false);setFlag(FLAG_H,((sp&0xF)+(d&0xF))>0xF);setFlag(FLAG_C,((sp&0xFF)+(uint8_t)d)>0xFF);setHl((uint16_t)r);return 12;}
-            case 0xE8:{int8_t d=(int8_t)fetch8();int r=sp+d;setFlag(FLAG_Z,false);setFlag(FLAG_N,false);setFlag(FLAG_H,((sp&0xF)+(d&0xF))>0xF);setFlag(FLAG_C,((sp&0xFF)+(uint8_t)d)>0xFF);sp=(uint16_t)r;return 16;}
-            case 0x03:setBc(bc()+1);return 8;case 0x13:setDe(de()+1);return 8;case 0x23:setHl(hl()+1);return 8;case 0x33:sp++;return 8;
-            case 0x0B:setBc(bc()-1);return 8;case 0x1B:setDe(de()-1);return 8;case 0x2B:setHl(hl()-1);return 8;case 0x3B:sp--;return 8;
-            case 0x09:case 0x19:case 0x29:case 0x39:{uint16_t v=op==0x09?bc():op==0x19?de():op==0x29?hl():sp;int r=hl()+v;setFlag(FLAG_N,false);setFlag(FLAG_H,((hl()&0xFFF)+(v&0xFFF))>0xFFF);setFlag(FLAG_C,r>0xFFFF);setHl((uint16_t)r);return 8;}
-            case 0x02:writeByte(bc(),a);return 8;case 0x12:writeByte(de(),a);return 8;
-            case 0x22:writeByte(hl(),a);setHl(hl()+1);return 8;case 0x32:writeByte(hl(),a);setHl(hl()-1);return 8;
-            case 0x0A:a=readByte(bc());return 8;case 0x1A:a=readByte(de());return 8;
-            case 0x2A:a=readByte(hl());setHl(hl()+1);return 8;case 0x3A:a=readByte(hl());setHl(hl()-1);return 8;
-            case 0xC6:aluAdd(fetch8(),false);return 8;case 0xCE:aluAdd(fetch8(),true);return 8;
-            case 0xD6:aluSub(fetch8(),false,true);return 8;case 0xDE:aluSub(fetch8(),true,true);return 8;
-            case 0xE6:aluAnd(fetch8());return 8;case 0xEE:aluXor(fetch8());return 8;
-            case 0xF6:aluOr(fetch8());return 8;case 0xFE:aluSub(fetch8(),false,false);return 8;
-            case 0xC3:pc=fetch16();return 16;
-            case 0xE9:pc=hl();return 4;
-            case 0x18:{int8_t d=(int8_t)fetch8();pc=(uint16_t)(pc+d);return 12;}
-            case 0xC2:case 0xCA:case 0xD2:case 0xDA:{uint16_t addr=fetch16();bool c=op==0xC2?!getFlag(FLAG_Z):op==0xCA?getFlag(FLAG_Z):op==0xD2?!getFlag(FLAG_C):getFlag(FLAG_C);if(c){pc=addr;return 16;}return 12;}
-            case 0x20:case 0x28:case 0x30:case 0x38:{int8_t d=(int8_t)fetch8();bool c=op==0x20?!getFlag(FLAG_Z):op==0x28?getFlag(FLAG_Z):op==0x30?!getFlag(FLAG_C):getFlag(FLAG_C);if(c){pc=(uint16_t)(pc+d);return 12;}return 8;}
-            case 0xCD:{uint16_t addr=fetch16();push16(pc);pc=addr;return 24;}
-            case 0xC4:case 0xCC:case 0xD4:case 0xDC:{uint16_t addr=fetch16();bool c=op==0xC4?!getFlag(FLAG_Z):op==0xCC?getFlag(FLAG_Z):op==0xD4?!getFlag(FLAG_C):getFlag(FLAG_C);if(c){push16(pc);pc=addr;return 24;}return 12;}
-            case 0xC9:pc=pop16();return 16;
-            case 0xD9:pc=pop16();ime=true;imeEnablePending=false;return 16;
-            case 0xC0:case 0xC8:case 0xD0:case 0xD8:{bool c=op==0xC0?!getFlag(FLAG_Z):op==0xC8?getFlag(FLAG_Z):op==0xD0?!getFlag(FLAG_C):getFlag(FLAG_C);if(c){pc=pop16();return 20;}return 8;}
-            case 0xC7:case 0xCF:case 0xD7:case 0xDF:case 0xE7:case 0xEF:case 0xF7:case 0xFF:push16(pc);pc=op-0xC7;return 16;
-            case 0xC5:push16(bc());return 16;case 0xD5:push16(de());return 16;
-            case 0xE5:push16(hl());return 16;case 0xF5:push16(((uint16_t)a<<8)|f);return 16;
-            case 0xC1:setBc(pop16());return 12;case 0xD1:setDe(pop16());return 12;
-            case 0xE1:setHl(pop16());return 12;case 0xF1:{uint16_t v=pop16();a=v>>8;f=v&0xF0;return 12;}
-            case 0xE0:writeByte(0xFF00+fetch8(),a);return 12;
-            case 0xF0:a=readByte(0xFF00+fetch8());return 12;
-            case 0xE2:writeByte(0xFF00+c,a);return 8;
-            case 0xF2:a=readByte(0xFF00+c);return 8;
-            case 0xEA:writeByte(fetch16(),a);return 16;
-            case 0xFA:a=readByte(fetch16());return 16;
-            case 0xCB:return 4+executeCb(fetch8());
-            default:return 4;
-        }
-    }
-
-    int executeCb(uint8_t op){
-        int r=op&7,b=(op>>3)&7;uint8_t v=getR(r),res=v;int g=op>>6;
-        if(g==0){switch(b){case 0:res=rlc(v);break;case 1:res=rrc(v);break;case 2:res=rl(v);break;case 3:res=rr(v);break;case 4:res=sla(v);break;case 5:res=sra(v);break;case 6:res=swap(v);break;case 7:res=srl(v);break;}setR(r,res);}
-        else if(g==1){setFlag(FLAG_Z,((v>>b)&1)==0);setFlag(FLAG_N,false);setFlag(FLAG_H,true);}
-        else if(g==2){setR(r,v&~(1u<<b));}
-        else {setR(r,v|(1u<<b));}
-        return r==6?((g==1)?8:12):4;
-    }
-};
-Bus g_bus;
 
 // ============================================================================
 // [v0.4] waveOut integration
@@ -1429,7 +1661,7 @@ void CerrarAudio() {
 }
 
 void EnviarFrameAudio() {
-    if (!g_waveOutReady || !g_audio_enabled) return;
+    if (!g_waveOutReady || !g_audio_enabled) { g_bus.apu.sampleCount = 0; return; }
 
     int n = g_bus.apu.sampleCount;   // samples estéreo totales (L+R ya contados)
     if (n <= 0) return;
@@ -1487,6 +1719,8 @@ void GuardarConfiguracionIni() {
     WritePrivateProfileStringA("Video", "Scale", szVal, szPath);
     wsprintfA(szVal, "%d", g_audio_enabled ? 1 : 0);
     WritePrivateProfileStringA("Audio", "Enabled", szVal, szPath);
+    wsprintfA(szVal, "%d", g_model_pref);
+    WritePrivateProfileStringA("System", "Model", szVal, szPath);
 }
 
 void CargarConfiguracionIni() {
@@ -1501,30 +1735,47 @@ void CargarConfiguracionIni() {
     if (g_window_scale < 1) g_window_scale = 1;
     if (g_window_scale > 4) g_window_scale = 4;
     g_audio_enabled = GetPrivateProfileIntA("Audio", "Enabled", 1, szPath) != 0;
+    g_model_pref = GetPrivateProfileIntA("System", "Model", 0, szPath) ? 1 : 0;
+}
+
+void CrearMenusExtra(HWND hWnd) {
+    HMENU hMenu = GetMenu(hWnd);
+    if (!hMenu) return;
+    HMENU hOption = GetSubMenu(hMenu, 2);
+    if (!hOption) return;
+    HMENU hSystem = CreatePopupMenu();
+    AppendMenuA(hSystem, MF_STRING, ID_SYSTEM_AUTO, "Auto (GBC si el cartucho lo soporta)");
+    AppendMenuA(hSystem, MF_STRING, ID_SYSTEM_DMG, "Game Boy (DMG)");
+    AppendMenuA(hOption, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hSystem, "&System");
+    AppendMenuA(hOption, MF_STRING, ID_AUDIO_TOGGLE, "&Audio");
+    CheckMenuRadioItem(hMenu, ID_SYSTEM_AUTO, ID_SYSTEM_DMG,
+                       g_model_pref ? ID_SYSTEM_DMG : ID_SYSTEM_AUTO, MF_BYCOMMAND);
+    CheckMenuItem(hMenu, ID_AUDIO_TOGGLE, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
+    DrawMenuBar(hWnd);
 }
 
 void GuardarSramCartucho() {
-    if (!g_rom_loaded) return;
+    if (!g_rom_loaded || !g_bus.hasBattery) return;
+    if (g_bus.ramSize == 0 && !g_bus.hasRtc) return;
     CreateDirectoryA(".\\gbsave", NULL);
     char szPath[MAX_PATH];
     wsprintfA(szPath, ".\\gbsave\\%s.sav", g_rom_base_name);
     std::ofstream f(szPath, std::ios::binary);
     if (!f) return;
-    f.write((char*)g_bus.ext_ram.data(), g_bus.ext_ram.size());
+    std::vector<uint8_t> data = g_bus.batteryData();
+    f.write((const char*)data.data(), (std::streamsize)data.size());
 }
 
 void CargarSramCartucho() {
     if (!g_rom_loaded) return;
     char szPath[MAX_PATH];
     wsprintfA(szPath, ".\\gbsave\\%s.sav", g_rom_base_name);
-    std::ifstream f(szPath, std::ios::binary | std::ios::ate);
-    if (!f) return;   // no existe: arranca con SRAM a cero (juego nuevo)
-    auto fsize = f.tellg();
-    if (fsize <= 0) return;
-    size_t toRead = (size_t)fsize;
-    if (toRead > g_bus.ext_ram.size()) toRead = g_bus.ext_ram.size();
-    f.seekg(0);
-    f.read((char*)g_bus.ext_ram.data(), toRead);
+    std::ifstream f(szPath, std::ios::binary);
+    if (!f) return;   // no existe: juego nuevo
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (data.empty()) return;
+    g_bus.loadBatteryData(data);
 }
 
 void GetKeyNameStr(DWORD vk, char* outName) {
@@ -1707,6 +1958,7 @@ void ActualizarEstadoMenusArchivo(HWND hWnd) {
 
 void LiberarRomActual(HWND hWnd) {
     if (!g_rom_loaded) return;
+    GuardarSramCartucho();
     g_bus.rom.clear();
     g_rom_loaded = false;
     g_emulation_paused = false;
@@ -1719,79 +1971,9 @@ void LiberarRomActual(HWND hWnd) {
 
 void ResetearEmulador(HWND hWnd) {
     if (!g_rom_loaded) return;
-
-    // ─── CPU: valores de boot según modo CGB o DMG ───────────────────
-    if (g_bus.isCgbMode) {
-        // Boot real de Game Boy Color
-        g_bus.a = 0x11; g_bus.f = 0x80;
-        g_bus.b = 0x00; g_bus.c = 0x00;
-        g_bus.d = 0xFF; g_bus.e = 0x56;
-        g_bus.h = 0x00; g_bus.l = 0x0D;
-    } else {
-        // Boot real de Game Boy / Pocket
-        g_bus.a = 0x01; g_bus.f = 0xB0;
-        g_bus.b = 0x00; g_bus.c = 0x13;
-        g_bus.d = 0x00; g_bus.e = 0xD8;
-        g_bus.h = 0x01; g_bus.l = 0x4D;
-    }
-    g_bus.pc = 0x100; g_bus.sp = 0xFFFE;
-    g_bus.ime = false; g_bus.imeEnablePending = false;
-    g_bus.halted = false; g_bus.haltBugPending = false;
-
-    // ─── Timer ───────────────────────────────────────────────────────
-    g_bus.divCounter = 0; g_bus.tima = 0; g_bus.tma = 0; g_bus.tac = 0;
-    g_bus.timaOverflowPending = false; g_bus.timaOverflowDelay = 0;
-
-    // ─── MBC ─────────────────────────────────────────────────────────
-    g_bus.ramEnabled = false; g_bus.ramBank = 0; g_bus.mbcMode = 0;
-    g_bus.rtcSelected = false; g_bus.rtcReg = 0; g_bus.rtcLatchRequested = false;
-    for (int i = 0; i < 5; ++i) { g_bus.rtcRegs[i] = 0; g_bus.rtcLatched[i] = 0; }
-    g_bus.rtcLatched_valid = false;
-    g_bus.rtcHalt = false;
-    g_bus.rtcLastUpdate = GetTickCount();
-    g_bus.romBank = 1;
-
-    // ─── DMA ─────────────────────────────────────────────────────────
-    g_bus.dmaActive = false; g_bus.dmaCyclesRemaining = 0;
-
-    // ─── Joypad ──────────────────────────────────────────────────────
-    g_bus.joypSelect = 0x30; g_bus.buttonsState = 0xFF;
-    // ─── Memoria (NO tocar ext_ram: ahí vive el save del cartucho) ──
-    g_bus.vram.fill(0);
-    g_bus.vram1.fill(0);
-    g_bus.oam.fill(0);
-    g_bus.io.fill(0);
-    g_bus.hram.fill(0);
-    g_bus.ie = 0;
-
-    // ─── PPU ─────────────────────────────────────────────────────────
-    g_bus.ly = 0; g_bus.ppuModeCycles = 0; g_bus.windowInternalLine = 0;
-    g_bus.lcdc = 0x91; g_bus.stat = 0x82;
-    g_bus.scy = 0; g_bus.scx = 0; g_bus.lyc = 0;
-    g_bus.wy = 0; g_bus.wx = 0;
-    g_bus.bgp = 0xFC; g_bus.obp0 = 0xFF; g_bus.obp1 = 0xFF;
-
-    // ─── Paletas CGB: limpiar (el juego las re-inicializa en boot) ──
-    g_bus.vbk = 0; g_bus.bcps = 0; g_bus.ocps = 0;
-// ★ Inicializar paletas a blanco (como el boot ROM de CGB)
-for (int i = 0; i < 64; i += 2) {
-    g_bus.bgPaletteRam[i]     = 0xFF;
-    g_bus.bgPaletteRam[i + 1] = 0x7F;
-    g_bus.objPaletteRam[i]     = 0xFF;
-    g_bus.objPaletteRam[i + 1] = 0x7F;
-}
-
-    // ─── APU ─────────────────────────────────────────────────────────
-	
-    g_bus.apu.reset();
-	g_bus.hdmaBank = 0;
-	g_bus.key1Armed = 0;
-    g_bus.cgbDoubleSpeed = false;
-
-    // ─── Pantalla a verde DMG ────────────────────────────────────────
-    for (int i = 0; i < GB_WIDTH * GB_HEIGHT; ++i)
-        g_screenBuffer[i] = 0x00557755;
-
+    // El reset no toca ext_ram: ahí vive el save del cartucho.
+    g_bus.reset();
+    memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
     g_emulation_paused = false;
     ActualizarEstadoMenusArchivo(hWnd);
     InvalidateRect(hWnd, NULL, FALSE);
@@ -1804,6 +1986,30 @@ void AlternarPausaEmulador(HWND hWnd) {
     ActualizarEstadoMenusArchivo(hWnd);
 }
 
+bool CargarRomDesdeRuta(HWND hWnd, const char* szFile) {
+    if (g_rom_loaded) GuardarSramCartucho();
+    if (!g_bus.loadRom(std::string(szFile))) {
+        g_rom_loaded = false;
+        MessageBoxA(hWnd, "No se pudo cargar la ROM.", "Rew. Reborn", MB_OK | MB_ICONERROR);
+        ActualizarEstadoMenusArchivo(hWnd);
+        return false;
+    }
+    lstrcpyA(g_rom_full_path, szFile);
+    g_rom_loaded = true;
+    const char* file_name = strrchr(szFile, '\\');
+    if (file_name) file_name++;
+    else file_name = szFile;
+    lstrcpyA(g_rom_base_name, file_name);
+    char* dot = strrchr(g_rom_base_name, '.');
+    if (dot) *dot = '\0';
+    CargarSramCartucho();
+    memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
+    g_emulation_paused = false;
+    ActualizarEstadoMenusArchivo(hWnd);
+    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+    return true;
+}
+
 void OpenRomDialog(HWND hWnd) {
     OPENFILENAMEA ofn;
     char szFile[MAX_PATH] = {0};
@@ -1812,22 +2018,9 @@ void OpenRomDialog(HWND hWnd) {
     ofn.hwndOwner = hWnd;
     ofn.lpstrFile = szFile;
     ofn.nMaxFile = sizeof(szFile);
-    ofn.lpstrFilter = "Game Boy ROMs\0*.gb;*.gbc\0";
+    ofn.lpstrFilter = "Game Boy ROMs\0*.gb;*.gbc;*.cgb\0All files\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST;
-    if (GetOpenFileNameA(&ofn) && g_bus.loadRom(std::string(szFile))) {
-        g_rom_loaded = true;
-        g_bus.romBank = 1;
-        char* file_name = strrchr(szFile, '\\');
-        if (file_name) file_name++;
-        else file_name = szFile;
-        lstrcpyA(g_rom_base_name, file_name);
-        char* dot = strrchr(g_rom_base_name, '.');
-        if (dot) *dot = '\0';
-		CargarSramCartucho();
-        for (int i = 0; i < GB_WIDTH * GB_HEIGHT; ++i) g_screenBuffer[i] = 0x00557755;
-        ActualizarEstadoMenusArchivo(hWnd);
-        RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-    }
+    if (GetOpenFileNameA(&ofn)) CargarRomDesdeRuta(hWnd, szFile);
 }
 
 void ActualizarMenuDeEstados(HWND hWnd) {
@@ -1860,120 +2053,42 @@ void ActualizarMenuDeEstados(HWND hWnd) {
 // ============================================================================
 // State save/load (v4)
 // ============================================================================
+struct StateWriter {
+    std::ofstream& f;
+    template <class T> void operator()(const T& v) { f.write((const char*)&v, sizeof(T)); }
+};
+struct StateReader {
+    std::ifstream& f;
+    template <class T> void operator()(T& v) { f.read((char*)&v, sizeof(T)); }
+};
+
 bool saveStateToFile(const std::string& path) {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
     uint32_t magic = Bus::kStateMagic, version = Bus::kStateVersion;
-    f.write((char*)&magic, 4); f.write((char*)&version, 4);
-    f.write((char*)&g_bus.pc, 2); f.write((char*)&g_bus.sp, 2);
-    f.write((char*)&g_bus.a, 1); f.write((char*)&g_bus.f, 1);
-    f.write((char*)&g_bus.b, 1); f.write((char*)&g_bus.c, 1);
-    f.write((char*)&g_bus.d, 1); f.write((char*)&g_bus.e, 1);
-    f.write((char*)&g_bus.h, 1); f.write((char*)&g_bus.l, 1);
-    uint8_t bi=g_bus.ime,bie=g_bus.imeEnablePending,bh=g_bus.halted,bhp=g_bus.haltBugPending;
-    f.write((char*)&bi, 1); f.write((char*)&bie, 1);
-    f.write((char*)&bh, 1); f.write((char*)&bhp, 1);
-    f.write((char*)&g_bus.divCounter, 2);
-    f.write((char*)&g_bus.tima, 1); f.write((char*)&g_bus.tma, 1); f.write((char*)&g_bus.tac, 1);
-    uint8_t btop = g_bus.timaOverflowPending; f.write((char*)&btop, 1);
-    int32_t tdel = g_bus.timaOverflowDelay; f.write((char*)&tdel, 4);
-    f.write((char*)&g_bus.lcdc, 1); f.write((char*)&g_bus.stat, 1);
-    f.write((char*)&g_bus.scy, 1); f.write((char*)&g_bus.scx, 1);
-    f.write((char*)&g_bus.lyc, 1); f.write((char*)&g_bus.wy, 1); f.write((char*)&g_bus.wx, 1);
-    f.write((char*)&g_bus.bgp, 1); f.write((char*)&g_bus.obp0, 1); f.write((char*)&g_bus.obp1, 1);
-    f.write((char*)&g_bus.ly, 1);
-    f.write((char*)&g_bus.vbk, 1); f.write((char*)&g_bus.bcps, 1); f.write((char*)&g_bus.ocps, 1);
-    f.write((char*)g_bus.bgPaletteRam.data(), 64);
-    f.write((char*)g_bus.objPaletteRam.data(), 64);
-    int32_t pmc = g_bus.ppuModeCycles; f.write((char*)&pmc, 4);
-    int32_t wil = g_bus.windowInternalLine; f.write((char*)&wil, 4);
-    f.write((char*)g_bus.vram.data(), 0x2000);
-    f.write((char*)g_bus.vram1.data(), 0x2000);
-    f.write((char*)g_bus.ext_ram.data(), 0x20000);
-    f.write((char*)g_bus.wram.data(), 0x2000);
-    f.write((char*)g_bus.oam.data(), 0xA0);
-    f.write((char*)g_bus.io.data(), 0x80);
-    f.write((char*)g_bus.hram.data(), 0x80);
-    f.write((char*)&g_bus.ie, 1);
-    f.write((char*)&g_bus.romBank, 2);
-    uint8_t re = g_bus.ramEnabled; f.write((char*)&re, 1);
-    f.write((char*)&g_bus.ramBank, 1);
-    f.write((char*)&g_bus.mbcMode, 1);
-    f.write((char*)&g_bus.mbcType, 1);
-    uint8_t dma = g_bus.dmaActive; f.write((char*)&dma, 1);
-    int32_t dr = g_bus.dmaCyclesRemaining; f.write((char*)&dr, 4);
-    f.write((char*)&g_bus.joypSelect, 1);
-    f.write((char*)&g_bus.buttonsState, 1);
-    // RTC
-    uint8_t rtcs = g_bus.rtcSelected ? 1 : 0;
-    f.write((char*)&rtcs, 1);
-    f.write((char*)&g_bus.rtcReg, 1);
-    f.write((char*)g_bus.rtcRegs, 5);
+    uint32_t romSize = (uint32_t)g_bus.rom.size();
+    f.write((char*)&magic, 4); f.write((char*)&version, 4); f.write((char*)&romSize, 4);
+    StateWriter w{f};
+    g_bus.serialize(w);
     return f.good();
 }
 
 bool loadStateFromFile(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(path, std::ios::binary);
     if (!f) return false;
-    // Sanity: check magic/version before touching anything
-    {
-        std::ifstream g(path, std::ios::binary);
-        if (!g) return false;
-        uint32_t magic=0, ver=0;
-        g.read((char*)&magic, 4); g.read((char*)&ver, 4);
-        if (magic != Bus::kStateMagic || ver != Bus::kStateVersion) return false;
-    }
-    f.seekg(0);
-    // Read into a temp copy
-    Bus tmp = g_bus;
-    uint32_t magic=0,ver=0;
-    f.read((char*)&magic,4); f.read((char*)&ver,4);
-    f.read((char*)&tmp.pc, 2); f.read((char*)&tmp.sp, 2);
-    f.read((char*)&tmp.a, 1); f.read((char*)&tmp.f, 1);
-    f.read((char*)&tmp.b, 1); f.read((char*)&tmp.c, 1);
-    f.read((char*)&tmp.d, 1); f.read((char*)&tmp.e, 1);
-    f.read((char*)&tmp.h, 1); f.read((char*)&tmp.l, 1);
-    uint8_t bi,bie,bh,bhp;
-    f.read((char*)&bi,1); f.read((char*)&bie,1); f.read((char*)&bh,1); f.read((char*)&bhp,1);
-    tmp.ime=bi!=0; tmp.imeEnablePending=bie!=0; tmp.halted=bh!=0; tmp.haltBugPending=bhp!=0;
-    f.read((char*)&tmp.divCounter,2);
-    f.read((char*)&tmp.tima,1); f.read((char*)&tmp.tma,1); f.read((char*)&tmp.tac,1);
-    uint8_t btop; f.read((char*)&btop,1); tmp.timaOverflowPending = btop!=0;
-    int32_t tdel; f.read((char*)&tdel,4); tmp.timaOverflowDelay = tdel;
-    f.read((char*)&tmp.lcdc,1); f.read((char*)&tmp.stat,1);
-    f.read((char*)&tmp.scy,1); f.read((char*)&tmp.scx,1);
-    f.read((char*)&tmp.lyc,1); f.read((char*)&tmp.wy,1); f.read((char*)&tmp.wx,1);
-    f.read((char*)&tmp.bgp,1); f.read((char*)&tmp.obp0,1); f.read((char*)&tmp.obp1,1);
-    f.read((char*)&tmp.ly,1);
-    f.read((char*)&tmp.vbk,1); f.read((char*)&tmp.bcps,1); f.read((char*)&tmp.ocps,1);
-    f.read((char*)tmp.bgPaletteRam.data(),64);
-    f.read((char*)tmp.objPaletteRam.data(),64);
-    int32_t pmc; f.read((char*)&pmc,4); tmp.ppuModeCycles = pmc;
-    int32_t wil; f.read((char*)&wil,4); tmp.windowInternalLine = wil;
-    f.read((char*)tmp.vram.data(),0x2000);
-    f.read((char*)tmp.vram1.data(),0x2000);
-    f.read((char*)tmp.ext_ram.data(),0x20000);
-    f.read((char*)tmp.wram.data(),0x2000);
-    f.read((char*)tmp.oam.data(),0xA0);
-    f.read((char*)tmp.io.data(),0x80);
-    f.read((char*)tmp.hram.data(),0x80);
-    f.read((char*)&tmp.ie,1);
-    f.read((char*)&tmp.romBank,2);
-    uint8_t re; f.read((char*)&re,1); tmp.ramEnabled = re!=0;
-    f.read((char*)&tmp.ramBank,1);
-    f.read((char*)&tmp.mbcMode,1);
-    f.read((char*)&tmp.mbcType,1);
-    uint8_t dma; f.read((char*)&dma,1); tmp.dmaActive = dma!=0;
-    int32_t dr; f.read((char*)&dr,4); tmp.dmaCyclesRemaining = dr;
-    f.read((char*)&tmp.joypSelect,1);
-    f.read((char*)&tmp.buttonsState,1);
-    uint8_t rtcs; f.read((char*)&rtcs,1); tmp.rtcSelected = rtcs!=0;
-    f.read((char*)&tmp.rtcReg,1);
-    f.read((char*)tmp.rtcRegs,5);
+    uint32_t magic = 0, version = 0, romSize = 0;
+    f.read((char*)&magic, 4); f.read((char*)&version, 4); f.read((char*)&romSize, 4);
+    if (!f.good() || magic != Bus::kStateMagic || version != Bus::kStateVersion || romSize != g_bus.rom.size())
+        return false;
+    static Bus tmp;
+    tmp = g_bus;
+    StateReader r{f};
+    tmp.serialize(r);
     if (!f.good()) return false;
-    if (tmp.ly > 153) tmp.ly = 0;
-    if (tmp.romBank == 0) tmp.romBank = 1;
+    tmp.apu.sampleCount = 0;
     g_bus = tmp;
+    tmp.rom.clear();
+    memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
     return true;
 }
 
@@ -2031,27 +2146,21 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v0.6.2-alpha\n"
+        "Rew. Reborn v0.7.0-alpha\n"
         "Emulador Game Boy / Game Boy Color\n\n"
-        "Novedades v0.6.2:\n"
-        "- Tomb Raider: corregidos glitches gr\341ficos y de audio\n"
-        "- Pokemon Crystal: corregida la banca WRAM\n"
-        "- Nuevas funciones Extra\n"
-        "- Correcci\xF3n de varios bugs\n\n"
-        "Estado actual:\n"
-        "- CPU, PPU, APU funcionales\n"
-        "- MBC1 / MBC3 / MBC5\n"
-        "- Save SRAM + Save States\n"
-        "- Doble velocidad CGB (parcial)\n"
-        "- HDMA con timing HBlank\n"
-        "- Paletas CGB y KEY1\n"
-        "- RTC en MBC3 (parcial)\n"
-        "- Oversampling 8x en audio\n"
-        "- Joypad 4 columnas configurables\n"
-        "- Frame limiter a 59.7 FPS\n\n"
-        "En desarrollo:\n"
-        "- Precisi\xF3n APU fina (dmg_sound)\n"
-        "- Detecci\xF3n SGB",
+        "- CPU con temporizaci\xF3n por M-ciclo\n"
+        "- Timer, interrupciones, HALT y halt bug\n"
+        "- PPU por dots, STAT por flanco, OAM DMA\n"
+        "- Bug de corrupci\xF3n de OAM (modo DMG)\n"
+        "- CGB: WRAM/VRAM banking, HDMA, paletas,\n"
+        "  doble velocidad\n"
+        "- MBC1 / MBC2 / MBC3 + RTC / MBC5\n"
+        "- APU sincronizada con DIV\n"
+        "- Save SRAM (+RTC) y Save States\n\n"
+        "Tests de Blargg: cpu_instrs, instr_timing,\n"
+        "mem_timing, mem_timing-2, halt_bug,\n"
+        "interrupt_time, dmg_sound, cgb_sound y\n"
+        "oam_bug (este \xFAltimo en modo DMG).",
         "About", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -2111,15 +2220,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND:
             if (EsComandoMenu(hWnd, LOWORD(wp), "Exit")) { DestroyWindow(hWnd); return 0; }
             if (EsComandoMenu(hWnd, LOWORD(wp), "About") || EsComandoMenu(hWnd, LOWORD(wp), "About...")) { MostrarAcercaDe(hWnd); return 0; }
+            if (LOWORD(wp) == ID_HELP_ABOUT || LOWORD(wp) == ID_OPTION_AUDIO_ENABLE) { MostrarAcercaDe(hWnd); return 0; }
             if (LOWORD(wp) == ID_FILE_LOADROM) OpenRomDialog(hWnd);
             if (LOWORD(wp) == ID_FILE_FREEROM) LiberarRomActual(hWnd);
             if (LOWORD(wp) == ID_FILE_RESET)   ResetearEmulador(hWnd);
             if (LOWORD(wp) == ID_FILE_PAUSE)   AlternarPausaEmulador(hWnd);
             if (LOWORD(wp) == ID_OPTION_KEY) DialogBoxParamA(GetModuleHandle(NULL), MAKEINTRESOURCEA(IDD_KEY_SETTING), hWnd, KeySettingProc, 0);
-            if (LOWORD(wp) == ID_OPTION_AUDIO_ENABLE) {
+            if (LOWORD(wp) == ID_AUDIO_TOGGLE) {
                 g_audio_enabled = !g_audio_enabled;
-                CheckMenuItem(hM, ID_OPTION_AUDIO_ENABLE, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
+                CheckMenuItem(hM, ID_AUDIO_TOGGLE, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
+                if (!g_audio_enabled && g_hWaveOut) waveOutReset(g_hWaveOut);
                 GuardarConfiguracionIni();
+            }
+            if (LOWORD(wp) == ID_SYSTEM_AUTO || LOWORD(wp) == ID_SYSTEM_DMG) {
+                int pref = (LOWORD(wp) == ID_SYSTEM_DMG) ? 1 : 0;
+                CheckMenuRadioItem(hM, ID_SYSTEM_AUTO, ID_SYSTEM_DMG, LOWORD(wp), MF_BYCOMMAND);
+                if (pref != g_model_pref) {
+                    g_model_pref = pref;
+                    GuardarConfiguracionIni();
+                    if (g_rom_loaded) {
+                        char path[MAX_PATH];
+                        lstrcpyA(path, g_rom_full_path);
+                        CargarRomDesdeRuta(hWnd, path);
+                    }
+                }
             }
             if (LOWORD(wp) == ID_STATE_SAVE) { if (g_rom_loaded) EjecutarSaveState(hWnd); else MessageBoxA(hWnd, "Carga una ROM primero.", "Aviso", MB_OK); }
             if (LOWORD(wp) == ID_STATE_LOAD) { if (g_rom_loaded) EjecutarLoadState(hWnd); else MessageBoxA(hWnd, "Carga una ROM primero.", "Aviso", MB_OK); }
@@ -2189,7 +2313,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
 
     RECT rc = {0, 0, GB_WIDTH * g_window_scale, GB_HEIGHT * g_window_scale};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
-    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.6.2-alpha", WS_OVERLAPPEDWINDOW,
+    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.7.0-alpha", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, hInst, NULL);
     ShowWindow(hWnd, nShow); UpdateWindow(hWnd);
 
@@ -2197,10 +2321,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     IniciarAudio(hWnd);
     CheckMenuRadioItem(GetMenu(hWnd), ID_VIDEO_X1, ID_VIDEO_X4,
                        ID_VIDEO_X1 + (g_window_scale - 1), MF_BYCOMMAND);
-    // Audio menu check
-    if (GetMenu(hWnd)) {
-        CheckMenuItem(GetMenu(hWnd), ID_OPTION_AUDIO_ENABLE, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
-    }
+    CrearMenusExtra(hWnd);
 
     LARGE_INTEGER qpcFreq, lastFrameTime;
     QueryPerformanceFrequency(&qpcFreq);
@@ -2218,14 +2339,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
             DispatchMessageA(&msg);
         } else {
             if (g_rom_loaded && !g_emulation_paused) {
-                int cyclesThisFrame = 0;
-                while (cyclesThisFrame < 70224) {
-                    int c = g_bus.step();
-                    if (c == 0) c = 4;
-                    cyclesThisFrame += c;
-                }
-				// NUEVO: procesar el APU una sola vez por frame completo
-                g_bus.apu.tick(70224);
+                g_bus.runFrame();
+                if (!(g_bus.lcdc & 0x80)) memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
                 // [v0.4] Auto Fire y audio
                 ActualizarAutoFire();
                 EnviarFrameAudio();				
@@ -2251,7 +2366,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                     double fps = fpsFrameCount / elapsedSec;
                     int fps10 = (int)(fps * 10);  // un decimal
                     char dbg[64];
-                    wsprintfA(dbg, "Rew. Reborn v0.6.2-alpha - %d.%d FPS", fps10 / 10, fps10 % 10);
+                    wsprintfA(dbg, "Rew. Reborn v0.7.0-alpha - %d.%d FPS", fps10 / 10, fps10 % 10);
                     SetWindowTextA(hWnd, dbg);
                     fpsFrameCount = 0;
                     QueryPerformanceCounter(&fpsTimerStart);
@@ -2264,3 +2379,5 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     }
     return (int)msg.wParam;
 }
+
+#endif // REW_HEADLESS

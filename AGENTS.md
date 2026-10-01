@@ -5,17 +5,20 @@ Win32 Game Boy / Game Boy Color emulator written in a single C++ translation
 unit plus Win32 resources.
 
 ## Files
-- `Rew. Reborn.cpp` — the entire emulator (CPU, PPU, APU, Bus, MBC1/3/5,
-  save states, waveOut audio, window/menu handling).
+- `Rew. Reborn.cpp` — the entire emulator (M-cycle CPU, PPU, APU, Bus,
+  MBC1/2/3(+RTC)/5, CGB WRAM/VRAM banking, save states, waveOut audio,
+  window/menu handling).
 - `resource.h` — header-only `#define`s (icon/menu/dialog IDs, 10 actions x 4
   key-binding slots). No includes.
 - `resource.rc` — icon, main menu, key-setting dialog, VERSIONINFO.
+- `app_icon.ico` — 16x16 32bpp icon referenced by `resource.rc`.
 - `resource.res` — compiled resources produced from `resource.rc`.
 - `resource.res.o` — compiled resources as a COFF object (linked into the exe).
 
 ## Build (Linux cross-compile)
 ```
 sudo apt-get install -y g++-mingw-w64-x86-64
+x86_64-w64-mingw32-windres resource.rc resource.res.o
 x86_64-w64-mingw32-g++ -std=c++17 "Rew. Reborn.cpp" resource.res.o \
     -o rew_reborn.exe -mwindows -static -static-libgcc -static-libstdc++ \
     -lwinmm -lcomdlg32 -lcomctl32 -lgdi32 -luser32
