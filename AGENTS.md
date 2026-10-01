@@ -17,8 +17,13 @@ unit plus Win32 resources.
 ```
 sudo apt-get install -y g++-mingw-w64-x86-64
 x86_64-w64-mingw32-g++ -std=c++17 "Rew. Reborn.cpp" resource.res.o \
-    -o rew_reborn.exe -mwindows -lwinmm -lcomdlg32 -lcomctl32 -lgdi32 -luser32
+    -o rew_reborn.exe -mwindows -static -static-libgcc -static-libstdc++ \
+    -lwinmm -lcomdlg32 -lcomctl32 -lgdi32 -luser32
 ```
+The `-static*` flags bundle the GCC/C++ runtime into the exe. Without them
+the binary imports `libstdc++-6.dll` / `libgcc_s_seh-1.dll`, and running it
+against an older MinGW runtime fails with "No se encuentra el punto de
+entrada del procedimiento _ZSt28__throw_bad_array_new_lengthv".
 Compiling just the source (`-c`) is a fast syntax check.
 
 ## Version / release conventions
