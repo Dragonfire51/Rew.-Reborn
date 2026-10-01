@@ -1,5 +1,11 @@
 // ============================================================================
 // Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
+// v0.8.0-alpha: modos Super Game Boy con borde y Speedup Toggle.
+//   - System: Auto, Game Boy (DMG), Super Game Boy, Game Boy + SGB Border,
+//     Game Boy Color + SGB Border y Game Boy Color + Initial SGB Border.
+//   - El borde SGB (256x224) se dibuja alrededor del area de juego 160x144.
+//   - Speedup Toggle: tecla mapeable que acelera la emulacion mientras se
+//     mantiene pulsada (disponible en los 4 perfiles de teclas).
 // v0.7.0-alpha: core reescrito con temporización por M-ciclo.
 //   - CPU SM83 con accesos a memoria ciclo a ciclo (timer/PPU/APU/DMA avanzan
 //     en cada acceso), temporización de interrupciones, HALT y halt bug.
@@ -38,6 +44,116 @@ bool g_rom_loaded = false;
 
 // 0 = automático (GBC si el cartucho lo soporta), 1 = forzar DMG
 int g_model_pref = 0;
+
+// ============================================================================
+// [v0.8] Super Game Boy: borde 256x224 alrededor del area de juego 160x144.
+// El borde se genera por procedimiento (sin tablas gigantes) a partir de un
+// indice de estilo y una paleta.
+// ============================================================================
+#define SGB_W 256
+#define SGB_H 224
+#define SGB_VX 48
+#define SGB_VY 40
+#define SGB_VW 160
+#define SGB_VH 144
+#define SGB_BORDER_COUNT 12
+#define SGB_SPEEDUP_MULT 4
+
+uint32_t g_sgbBuffer[SGB_W * SGB_H] = {0};
+bool g_sgb_border_active = false;
+int g_sgb_border_index = 0;
+bool g_speedup_held = false;
+
+// Modos de sistema (System menu). 0 y 1 ya existian.
+enum { SYS_AUTO = 0, SYS_DMG = 1, SYS_SGB = 2, SYS_GB_SGB = 3, SYS_GBC_SGB = 4, SYS_GBC_INIT_SGB = 5 };
+const int SYSTEM_MODE_COUNT = 6;
+
+const char* g_system_mode_names[SYSTEM_MODE_COUNT] = {
+    "Auto (GBC si el cartucho lo soporta)",
+    "Game Boy (DMG)",
+    "Super Game Boy",
+    "Game Boy + SGB Border",
+    "Game Boy Color + SGB Border",
+    "Game Boy Color + Initial SGB Border"
+};
+
+// Paletas (base, acento) por modo. En los modos SGB se usan 8 estilos.
+static const uint32_t kSgbBase[SYSTEM_MODE_COUNT] = {
+    0x000000, 0x000000, 0x505860, 0x186028, 0x303088, 0x707018
+};
+static const uint32_t kSgbAccent[SYSTEM_MODE_COUNT] = {
+    0x000000, 0x000000, 0xC8D0D8, 0x88C860, 0xFFD040, 0xF0E0A0
+};
+
+bool ModeUsesBorder(int mode) { return mode >= SYS_SGB; }
+bool ModeIsSgb(int mode) { return mode == SYS_SGB || mode == SYS_GB_SGB; }
+// El modo CGB se decide por la ROM; Initial SGB Border fuerza GBC.
+bool ModeForcesCgb(int mode) { return mode == SYS_GBC_SGB || mode == SYS_GBC_INIT_SGB; }
+
+void GenerarBordeSgb(int index, uint32_t base, uint32_t accent);
+
+void InitSgbBorder(int mode) {
+    g_sgb_border_active = ModeUsesBorder(mode);
+    if (!g_sgb_border_active) return;
+    // Estilo de borde derivado del modo, para que cada opcion se vea distinta.
+    g_sgb_border_index = (mode * 3) % SGB_BORDER_COUNT;
+    GenerarBordeSgb(g_sgb_border_index, kSgbBase[mode], kSgbAccent[mode]);
+}
+
+// Genera el borde 256x224 de forma procedural. `index` varia el patron.
+void GenerarBordeSgb(int index, uint32_t base, uint32_t accent) {
+    auto ch = [](uint32_t c, int sh) { return (uint8_t)((c >> sh) & 0xFF); };
+    int br = ch(base, 16), bg = ch(base, 8), bb = ch(base, 0);
+    int ar = ch(accent, 16), ag = ch(accent, 8), ab = ch(accent, 0);
+    auto mix = [](int a, int b, int t) { return (a * (255 - t) + b * t) / 255; };
+    auto dark = [&](int v) { return v * 55 / 100; };
+    int dbr = dark(br), dbg = dark(bg), dbb = dark(bb);
+
+    for (int y = 0; y < SGB_H; ++y) {
+        for (int x = 0; x < SGB_W; ++x) {
+            // Fondo con damero desplazado segun el estilo.
+            int cell = ((x + index * 4) >> 3) + ((y + index * 2) >> 3);
+            int r = (cell & 1) ? mix(br, ar, 90) : br;
+            int g = (cell & 1) ? mix(bg, ag, 90) : bg;
+            int b = (cell & 1) ? mix(bb, ab, 90) : bb;
+            // Rejilla cada 16 px.
+            if ((x % 16) == 0 || (x % 16) == 15 || (y % 16) == 0 || (y % 16) == 15) {
+                r = dbr; g = dbg; b = dbb;
+            }
+            // Marco exterior de 2 px.
+            if (x < 2 || y < 2 || x >= SGB_W - 2 || y >= SGB_H - 2) { r = ar; g = ag; b = ab; }
+            g_sgbBuffer[y * SGB_W + x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+    }
+
+    // Marco interior alrededor del area de juego (6 px, oscuro + acento).
+    for (int y = SGB_VY - 6; y < SGB_VY + SGB_VH + 6; ++y) {
+        for (int x = SGB_VX - 6; x < SGB_VX + SGB_VW + 6; ++x) {
+            if (x < 0 || y < 0 || x >= SGB_W || y >= SGB_H) continue;
+            bool inside = x >= SGB_VX && x < SGB_VX + SGB_VW && y >= SGB_VY && y < SGB_VY + SGB_VH;
+            if (inside) continue;
+            bool inner = x >= SGB_VX - 2 && x < SGB_VX + SGB_VW + 2 &&
+                         y >= SGB_VY - 2 && y < SGB_VY + SGB_VH + 2;
+            uint32_t c = inner ? accent : ((uint32_t)dbr << 16) | ((uint32_t)dbg << 8) | dbb;
+            g_sgbBuffer[y * SGB_W + x] = c;
+        }
+    }
+
+    // Adornos en las cuatro esquinas del area de juego.
+    const int cx[4] = {SGB_VX - 14, SGB_VX + SGB_VW + 4, SGB_VX - 14, SGB_VX + SGB_VW + 4};
+    const int cy[4] = {SGB_VY - 14, SGB_VY - 14, SGB_VY + SGB_VH + 4, SGB_VY + SGB_VH + 4};
+    for (int k = 0; k < 4; ++k)
+        for (int dy = 0; dy < 10; ++dy)
+            for (int dx = 0; dx < 10; ++dx) {
+                int x = cx[k] + dx, y = cy[k] + dy;
+                if (x < 0 || y < 0 || x >= SGB_W || y >= SGB_H) continue;
+                g_sgbBuffer[y * SGB_W + x] = ((dx + dy) % 4 < 2) ? accent
+                    : ((uint32_t)dbr << 16) | ((uint32_t)dbg << 8) | dbb;
+            }
+}
+
+// Copia el frame 160x144 al centro del borde para presentarlo.
+// (Definido despues de la instancia global `g_bus`.)
 
 // ============================================================================
 // APU
@@ -567,7 +683,11 @@ public:
 
         mbc1Multicart = mbcType == 1 && rom.size() == 0x100000 &&
                         std::equal(rom.begin() + 0x104, rom.begin() + 0x134, rom.begin() + 0x40104);
-        isCgbMode = (rom[0x143] & 0x80) != 0 && g_model_pref != 1;
+        // Modo CGB: por cabecera del cartucho, salvo que el modo de sistema lo
+        // fuerce (DMG o los modos "Game Boy Color + ... SGB Border").
+        if (g_model_pref == SYS_DMG) isCgbMode = false;
+        else if (ModeForcesCgb(g_model_pref)) isCgbMode = true;
+        else isCgbMode = (rom[0x143] & 0x80) != 0;
         ext_ram.fill(0xFF);
         reset();
         return true;
@@ -1574,6 +1694,15 @@ constexpr int Bus::kClockSelectBit[4];
 constexpr uint8_t Bus::kButtonBit[8];
 
 Bus g_bus;
+
+// Copia el frame 160x144 al centro del borde para presentarlo.
+void ComponerFrameSgb() {
+    if (!g_sgb_border_active) return;
+    for (int y = 0; y < SGB_VH; ++y)
+        for (int x = 0; x < SGB_VW; ++x)
+            g_sgbBuffer[(SGB_VY + y) * SGB_W + (SGB_VX + x)] = g_bus.frameBuf[y * GB_WIDTH + x];
+}
+
 #ifndef REW_HEADLESS
 int g_active_slot = 0;
 bool g_emulation_paused = false;
@@ -1588,22 +1717,27 @@ int  g_auto_fire_counter[2]  = { 0, 0 };
 const int AUTO_FIRE_FRAMES = 10;  // toggle cada 10 frames (~6 Hz)
 
 // Acciones: 0=UP 1=DOWN 2=LEFT 3=RIGHT 4=A 5=B 6=Select 7=Start
-DWORD g_bindings[8][4] = {
+//           8=AutoA 9=AutoB 10=Speedup
+#define MAX_ACTIONS 11
+DWORD g_bindings[MAX_ACTIONS][4] = {
     { VK_UP,    0, 0, 0 }, { VK_DOWN,  0, 0, 0 },
     { VK_LEFT,  0, 0, 0 }, { VK_RIGHT, 0, 0, 0 },
     { 'Z',      0, 0, 0 }, { 'X',      0, 0, 0 },
-    { VK_SPACE, 0, 0, 0 }, { VK_RETURN,0, 0, 0 }
+    { VK_SPACE, 0, 0, 0 }, { VK_RETURN,0, 0, 0 },
+    { 0,        0, 0, 0 }, { 0,        0, 0, 0 },
+    { VK_TAB,   0, 0, 0 }
 };
-const char* g_action_names[8] = {
-    "UP", "DOWN", "LEFT", "RIGHT", "A", "B", "Select", "Start"
+const char* g_action_names[MAX_ACTIONS] = {
+    "UP", "DOWN", "LEFT", "RIGHT", "A", "B", "Select", "Start",
+    "AutoA", "AutoB", "Speedup"
 };
 
-WNDPROC g_origEditProc[10][4] = { nullptr };
+WNDPROC g_origEditProc[MAX_ACTIONS][4] = { nullptr };
 
 // Comandos creados en tiempo de ejecución (el .rc no los incluye)
 #define ID_SYSTEM_AUTO   40040
 #define ID_SYSTEM_DMG    40041
-#define ID_AUDIO_TOGGLE  40042
+#define ID_AUDIO_TOGGLE  40050
 
 void ActualizarMenuDeEstados(HWND hWnd);
 
@@ -1708,7 +1842,7 @@ void GetIniPath(char* szOut) {
 void GuardarConfiguracionIni() {
     char szPath[MAX_PATH]; GetIniPath(szPath);
     char szVal[32];
-    for (int a = 0; a < 8; ++a)
+    for (int a = 0; a < MAX_ACTIONS; ++a)
         for (int c = 0; c < 4; ++c) {
             char key[32];
             wsprintfA(key, "%s_%d", g_action_names[a], c + 1);
@@ -1725,7 +1859,7 @@ void GuardarConfiguracionIni() {
 
 void CargarConfiguracionIni() {
     char szPath[MAX_PATH]; GetIniPath(szPath);
-    for (int a = 0; a < 8; ++a)
+    for (int a = 0; a < MAX_ACTIONS; ++a)
         for (int c = 0; c < 4; ++c) {
             char key[32];
             wsprintfA(key, "%s_%d", g_action_names[a], c + 1);
@@ -1735,7 +1869,9 @@ void CargarConfiguracionIni() {
     if (g_window_scale < 1) g_window_scale = 1;
     if (g_window_scale > 4) g_window_scale = 4;
     g_audio_enabled = GetPrivateProfileIntA("Audio", "Enabled", 1, szPath) != 0;
-    g_model_pref = GetPrivateProfileIntA("System", "Model", 0, szPath) ? 1 : 0;
+    g_model_pref = GetPrivateProfileIntA("System", "Model", 0, szPath);
+    if (g_model_pref < 0 || g_model_pref >= SYSTEM_MODE_COUNT) g_model_pref = SYS_AUTO;
+    InitSgbBorder(g_model_pref);
 }
 
 void CrearMenusExtra(HWND hWnd) {
@@ -1744,13 +1880,13 @@ void CrearMenusExtra(HWND hWnd) {
     HMENU hOption = GetSubMenu(hMenu, 2);
     if (!hOption) return;
     HMENU hSystem = CreatePopupMenu();
-    AppendMenuA(hSystem, MF_STRING, ID_SYSTEM_AUTO, "Auto (GBC si el cartucho lo soporta)");
-    AppendMenuA(hSystem, MF_STRING, ID_SYSTEM_DMG, "Game Boy (DMG)");
+    for (int m = 0; m < SYSTEM_MODE_COUNT; ++m)
+        AppendMenuA(hSystem, MF_STRING, ID_SYSTEM_AUTO + m, g_system_mode_names[m]);
     AppendMenuA(hOption, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hSystem, "&System");
     AppendMenuA(hOption, MF_STRING, ID_AUDIO_TOGGLE, "&Audio");
-    CheckMenuRadioItem(hMenu, ID_SYSTEM_AUTO, ID_SYSTEM_DMG,
-                       g_model_pref ? ID_SYSTEM_DMG : ID_SYSTEM_AUTO, MF_BYCOMMAND);
+    CheckMenuRadioItem(hMenu, ID_SYSTEM_AUTO, ID_SYSTEM_AUTO + SYSTEM_MODE_COUNT - 1,
+                       ID_SYSTEM_AUTO + g_model_pref, MF_BYCOMMAND);
     CheckMenuItem(hMenu, ID_AUDIO_TOGGLE, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
     DrawMenuBar(hWnd);
 }
@@ -1782,6 +1918,7 @@ void GetKeyNameStr(DWORD vk, char* outName) {
     if (vk == 0) { lstrcpyA(outName, "???"); return; }
     if (vk == VK_SPACE) lstrcpyA(outName, "Space");
     else if (vk == VK_RETURN) lstrcpyA(outName, "Enter");
+    else if (vk == VK_TAB) lstrcpyA(outName, "Tab");
     else if (vk == VK_BACK) lstrcpyA(outName, "Backspace");
     else if (vk == VK_UP) lstrcpyA(outName, "Up");
     else if (vk == VK_DOWN) lstrcpyA(outName, "Down");
@@ -1793,19 +1930,22 @@ void GetKeyNameStr(DWORD vk, char* outName) {
 }
 
 // Tabla global para mapear ID de control -> (accion, columna)
-static const int kAllCtrlIds[8][4] = {
-    { IDC_KEY_UP_1,     IDC_KEY_UP_2,     IDC_KEY_UP_3,     IDC_KEY_UP_4     },
-    { IDC_KEY_DOWN_1,   IDC_KEY_DOWN_2,   IDC_KEY_DOWN_3,   IDC_KEY_DOWN_4   },
-    { IDC_KEY_LEFT_1,   IDC_KEY_LEFT_2,   IDC_KEY_LEFT_3,   IDC_KEY_LEFT_4   },
-    { IDC_KEY_RIGHT_1,  IDC_KEY_RIGHT_2,  IDC_KEY_RIGHT_3,  IDC_KEY_RIGHT_4  },
-    { IDC_KEY_A_1,      IDC_KEY_A_2,      IDC_KEY_A_3,      IDC_KEY_A_4      },
-    { IDC_KEY_B_1,      IDC_KEY_B_2,      IDC_KEY_B_3,      IDC_KEY_B_4      },
-    { IDC_KEY_SELECT_1, IDC_KEY_SELECT_2, IDC_KEY_SELECT_3, IDC_KEY_SELECT_4 },
-    { IDC_KEY_START_1,  IDC_KEY_START_2,  IDC_KEY_START_3,  IDC_KEY_START_4  }
+static const int kAllCtrlIds[MAX_ACTIONS][4] = {
+    { IDC_KEY_UP_1,      IDC_KEY_UP_2,      IDC_KEY_UP_3,      IDC_KEY_UP_4      },
+    { IDC_KEY_DOWN_1,    IDC_KEY_DOWN_2,    IDC_KEY_DOWN_3,    IDC_KEY_DOWN_4    },
+    { IDC_KEY_LEFT_1,    IDC_KEY_LEFT_2,    IDC_KEY_LEFT_3,    IDC_KEY_LEFT_4    },
+    { IDC_KEY_RIGHT_1,   IDC_KEY_RIGHT_2,   IDC_KEY_RIGHT_3,   IDC_KEY_RIGHT_4   },
+    { IDC_KEY_A_1,       IDC_KEY_A_2,       IDC_KEY_A_3,       IDC_KEY_A_4       },
+    { IDC_KEY_B_1,       IDC_KEY_B_2,       IDC_KEY_B_3,       IDC_KEY_B_4       },
+    { IDC_KEY_SELECT_1,  IDC_KEY_SELECT_2,  IDC_KEY_SELECT_3,  IDC_KEY_SELECT_4  },
+    { IDC_KEY_START_1,   IDC_KEY_START_2,   IDC_KEY_START_3,   IDC_KEY_START_4   },
+    { IDC_KEY_AUTOA_1,   IDC_KEY_AUTOA_2,   IDC_KEY_AUTOA_3,   IDC_KEY_AUTOA_4   },
+    { IDC_KEY_AUTOB_1,   IDC_KEY_AUTOB_2,   IDC_KEY_AUTOB_3,   IDC_KEY_AUTOB_4   },
+    { IDC_KEY_SPEEDUP_1, IDC_KEY_SPEEDUP_2, IDC_KEY_SPEEDUP_3, IDC_KEY_SPEEDUP_4 }
 };
 
 static bool BuscarIndiceBinding(int ctrlId, int& outA, int& outC) {
-    for (int a = 0; a < 8; ++a)
+    for (int a = 0; a < MAX_ACTIONS; ++a)
         for (int c = 0; c < 4; ++c)
             if (kAllCtrlIds[a][c] == ctrlId) { outA = a; outC = c; return true; }
     return false;
@@ -1813,13 +1953,8 @@ static bool BuscarIndiceBinding(int ctrlId, int& outA, int& outC) {
 
 // Get the 4 column IDs for a given action
 int GetColumnID(int action, int col) {
-    // rows: 0=UP 1=DOWN 2=LEFT 3=RIGHT 4=A 5=B 6=AutoA 7=AutoB 8=Start 9=Select
-    static const int bases[10] = {
-        IDC_KEY_UP_1, IDC_KEY_DOWN_1, IDC_KEY_LEFT_1, IDC_KEY_RIGHT_1,
-        IDC_KEY_A_1, IDC_KEY_B_1, IDC_KEY_AUTOA_1, IDC_KEY_AUTOB_1,
-        IDC_KEY_START_1, IDC_KEY_SELECT_1
-    };
-    return bases[action] + col;
+    if (action < 0 || action >= MAX_ACTIONS || col < 0 || col >= 4) return 0;
+    return kAllCtrlIds[action][col];
 }
 
 LRESULT CALLBACK EditWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1839,13 +1974,8 @@ LRESULT CALLBACK EditWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     // Capturar teclas
     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
-        // TAB: dejar pasar al WndProc original (que mueve el foco)
-        if (wp == VK_TAB) {
-            if (a >= 0 && c >= 0 && g_origEditProc[a][c]) {
-                return CallWindowProcA(g_origEditProc[a][c], hWnd, msg, wp, lp);
-            }
-            return DefWindowProcA(hWnd, msg, wp, lp);
-        }
+        // TAB: capturar como binding (permite mapear Speedup a Tab). El dialogo
+        // no navega con Tab para no perder la tecla al configurar.
         // ESC: limpiar el binding
         if (wp == VK_ESCAPE) {
             SetWindowTextA(hWnd, "???");
@@ -1858,6 +1988,7 @@ LRESULT CALLBACK EditWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (szKey[0] == '\0') {
             switch (wp) {
                 case VK_SPACE:  lstrcpyA(szKey, "Space");    break;
+                case VK_TAB:    lstrcpyA(szKey, "Tab");      break;
                 case VK_RETURN: lstrcpyA(szKey, "Enter");    break;
                 case VK_BACK:   lstrcpyA(szKey, "Backspace");break;
                 case VK_DELETE: lstrcpyA(szKey, "Delete");   break;
@@ -1881,7 +2012,7 @@ INT_PTR CALLBACK KeySettingProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
         SendDlgItemMessageA(hDlg, IDC_PLAYER_COMBO, CB_ADDSTRING, 0, (LPARAM)"1P");
         SendDlgItemMessageA(hDlg, IDC_PLAYER_COMBO, CB_SETCURSEL, 0, 0);
 
-        for (int a = 0; a < 8; ++a) {
+        for (int a = 0; a < MAX_ACTIONS; ++a) {
             for (int c = 0; c < 4; ++c) {
                 HWND hE = GetDlgItem(hDlg, kAllCtrlIds[a][c]);
                 if (!hE) continue;
@@ -1901,7 +2032,7 @@ INT_PTR CALLBACK KeySettingProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_COMMAND) {
         if (LOWORD(wp) == IDOK) {
             // Restaurar WndProcs originales
-            for (int a = 0; a < 8; ++a)
+            for (int a = 0; a < MAX_ACTIONS; ++a)
                 for (int c = 0; c < 4; ++c) {
                     HWND hE = GetDlgItem(hDlg, kAllCtrlIds[a][c]);
                     if (hE && g_origEditProc[a][c]) {
@@ -1915,7 +2046,7 @@ INT_PTR CALLBACK KeySettingProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (LOWORD(wp) == IDCANCEL) {
             // Restaurar WndProcs originales
-            for (int a = 0; a < 8; ++a)
+            for (int a = 0; a < MAX_ACTIONS; ++a)
                 for (int c = 0; c < 4; ++c) {
                     HWND hE = GetDlgItem(hDlg, kAllCtrlIds[a][c]);
                     if (hE && g_origEditProc[a][c]) {
@@ -1933,7 +2064,9 @@ INT_PTR CALLBACK KeySettingProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ResizeEmulatorWindow(HWND hWnd, int scale) {
-    RECT rc = {0, 0, GB_WIDTH * scale, GB_HEIGHT * scale};
+    int w = g_sgb_border_active ? SGB_W : GB_WIDTH;
+    int h = g_sgb_border_active ? SGB_H : GB_HEIGHT;
+    RECT rc = {0, 0, w * scale, h * scale};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
     SetWindowPos(hWnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     InvalidateRect(hWnd, NULL, TRUE);
@@ -2146,8 +2279,14 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v0.7.0-alpha\n"
+        "Rew. Reborn v0.8.0-alpha\n"
         "Emulador Game Boy / Game Boy Color\n\n"
+        "- Modos Super Game Boy con borde (256x224):\n"
+        "  Game Boy, Game Boy Color + SGB Border y\n"
+        "  Game Boy Color + Initial SGB Border\n"
+        "- Speedup Toggle: tecla mapeable que acelera\n"
+        "  la emulaci\xF3n mientras se mantiene pulsada\n"
+        "- Auto A / Auto B mapeables (disparo autom\xE1tico)\n"
         "- CPU con temporizaci\xF3n por M-ciclo\n"
         "- Timer, interrupciones, HALT y halt bug\n"
         "- PPU por dots, STAT por flanco, OAM DMA\n"
@@ -2196,25 +2335,32 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_KEYDOWN: {
             if ((static_cast<uint32_t>(lp) & (1u << 30)) != 0) break;
             uint32_t vk = (uint32_t)wp;
-            for (int a = 0; a < 8; ++a)
+            for (int a = 0; a < MAX_ACTIONS; ++a)
                 for (int c = 0; c < 4; ++c)
                     if (g_bindings[a][c] == vk && vk != 0) {
-                        g_bus.setButton(a, true);
+                        if (a <= 7) g_bus.setButton(a, true);
+                        else if (a == 8) g_auto_fire_enabled[0] = true;   // Auto A
+                        else if (a == 9) g_auto_fire_enabled[1] = true;   // Auto B
+                        else if (a == 10) g_speedup_held = true;          // Speedup
                     }
             break;
         }
         case WM_KEYUP: {
             uint32_t vk = (uint32_t)wp;
-            for (int a = 0; a < 8; ++a)
+            for (int a = 0; a < MAX_ACTIONS; ++a)
                 for (int c = 0; c < 4; ++c)
                     if (g_bindings[a][c] == vk && vk != 0) {
-                        g_bus.setButton(a, false);
+                        if (a <= 7) g_bus.setButton(a, false);
+                        else if (a == 8) { g_auto_fire_enabled[0] = false; g_bus.setButton(4, false); }
+                        else if (a == 9) { g_auto_fire_enabled[1] = false; g_bus.setButton(5, false); }
+                        else if (a == 10) g_speedup_held = false;
                     }
             break;
         }
         case WM_KILLFOCUS:
             g_bus.releaseAllButtons();
             g_auto_fire_enabled[0] = g_auto_fire_enabled[1] = false;
+            g_speedup_held = false;
             break;
 
         case WM_COMMAND:
@@ -2232,11 +2378,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (!g_audio_enabled && g_hWaveOut) waveOutReset(g_hWaveOut);
                 GuardarConfiguracionIni();
             }
-            if (LOWORD(wp) == ID_SYSTEM_AUTO || LOWORD(wp) == ID_SYSTEM_DMG) {
-                int pref = (LOWORD(wp) == ID_SYSTEM_DMG) ? 1 : 0;
-                CheckMenuRadioItem(hM, ID_SYSTEM_AUTO, ID_SYSTEM_DMG, LOWORD(wp), MF_BYCOMMAND);
+            if (LOWORD(wp) >= ID_SYSTEM_AUTO &&
+                LOWORD(wp) < ID_SYSTEM_AUTO + SYSTEM_MODE_COUNT) {
+                int pref = LOWORD(wp) - ID_SYSTEM_AUTO;
+                CheckMenuRadioItem(hM, ID_SYSTEM_AUTO, ID_SYSTEM_AUTO + SYSTEM_MODE_COUNT - 1,
+                                   LOWORD(wp), MF_BYCOMMAND);
                 if (pref != g_model_pref) {
                     g_model_pref = pref;
+                    InitSgbBorder(pref);
+                    ResizeEmulatorWindow(hWnd, g_window_scale);
                     GuardarConfiguracionIni();
                     if (g_rom_loaded) {
                         char path[MAX_PATH];
@@ -2269,14 +2419,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetStretchBltMode(hdc, COLORONCOLOR);
             BITMAPINFO bmi = {};
             bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            bmi.bmiHeader.biWidth = GB_WIDTH;
-            bmi.bmiHeader.biHeight = -GB_HEIGHT;
+            bmi.bmiHeader.biWidth = g_sgb_border_active ? SGB_W : GB_WIDTH;
+            bmi.bmiHeader.biHeight = g_sgb_border_active ? -SGB_H : -GB_HEIGHT;
             bmi.bmiHeader.biPlanes = 1;
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
             StretchDIBits(hdc, 0, 0, cr.right, cr.bottom,
-                          0, 0, GB_WIDTH, GB_HEIGHT,
-                          g_screenBuffer, &bmi, DIB_RGB_COLORS, SRCCOPY);
+                          0, 0, bmi.bmiHeader.biWidth, -bmi.bmiHeader.biHeight,
+                          g_sgb_border_active ? g_sgbBuffer : g_screenBuffer,
+                          &bmi, DIB_RGB_COLORS, SRCCOPY);
             EndPaint(hWnd, &ps);
             break;
         }
@@ -2311,9 +2462,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     InitCommonControlsEx(&icc);
     RegisterClassExA(&wc);
 
-    RECT rc = {0, 0, GB_WIDTH * g_window_scale, GB_HEIGHT * g_window_scale};
+    RECT rc = {0, 0, (g_sgb_border_active ? SGB_W : GB_WIDTH) * g_window_scale,
+               (g_sgb_border_active ? SGB_H : GB_HEIGHT) * g_window_scale};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
-    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.7.0-alpha", WS_OVERLAPPEDWINDOW,
+    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.8.0-alpha", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, hInst, NULL);
     ShowWindow(hWnd, nShow); UpdateWindow(hWnd);
 
@@ -2339,34 +2491,43 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
             DispatchMessageA(&msg);
         } else {
             if (g_rom_loaded && !g_emulation_paused) {
-                g_bus.runFrame();
-                if (!(g_bus.lcdc & 0x80)) memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
-                // [v0.4] Auto Fire y audio
-                ActualizarAutoFire();
+                // Speedup: si la tecla esta pulsada se ejecutan varios frames
+                // sin esperar el sincronismo de tiempo real.
+                int framesThisTick = g_speedup_held ? SGB_SPEEDUP_MULT : 1;
+                for (int f = 0; f < framesThisTick; ++f) {
+                    g_bus.runFrame();
+                    if (!(g_bus.lcdc & 0x80)) memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
+                    if (g_sgb_border_active) ComponerFrameSgb();
+                    // [v0.4] Auto Fire
+                    ActualizarAutoFire();
+                }
                 EnviarFrameAudio();				
                 InvalidateRect(hWnd, NULL, FALSE);
                 UpdateWindow(hWnd);
 
                 LARGE_INTEGER now;
                 QueryPerformanceCounter(&now);
-                LONGLONG elapsed = now.QuadPart - lastFrameTime.QuadPart;
-                if (elapsed < ticksPerFrame) {
-                    LONGLONG remaining = ticksPerFrame - elapsed;
-                    DWORD sleepMs = (DWORD)(remaining / (qpcFreq.QuadPart / 1000));
-                    if (sleepMs > 3) Sleep(sleepMs - 2);
-                    do { QueryPerformanceCounter(&now); }
-                    while ((now.QuadPart - lastFrameTime.QuadPart) < ticksPerFrame);
+                if (!g_speedup_held) {
+                    LONGLONG elapsed = now.QuadPart - lastFrameTime.QuadPart;
+                    if (elapsed < ticksPerFrame) {
+                        LONGLONG remaining = ticksPerFrame - elapsed;
+                        DWORD sleepMs = (DWORD)(remaining / (qpcFreq.QuadPart / 1000));
+                        if (sleepMs > 3) Sleep(sleepMs - 2);
+                        do { QueryPerformanceCounter(&now); }
+                        while ((now.QuadPart - lastFrameTime.QuadPart) < ticksPerFrame);
+                    }
                 }
                 // ★ Contador de FPS (actualiza cada 1 segundo)
-                fpsFrameCount++;
+                fpsFrameCount += framesThisTick;
                 LARGE_INTEGER fpsNow;
                 QueryPerformanceCounter(&fpsNow);
                 double elapsedSec = (double)(fpsNow.QuadPart - fpsTimerStart.QuadPart) / qpcFreq.QuadPart;
                 if (elapsedSec >= 1.0) {
                     double fps = fpsFrameCount / elapsedSec;
                     int fps10 = (int)(fps * 10);  // un decimal
-                    char dbg[64];
-                    wsprintfA(dbg, "Rew. Reborn v0.7.0-alpha - %d.%d FPS", fps10 / 10, fps10 % 10);
+                    char dbg[80];
+                    wsprintfA(dbg, "Rew. Reborn v0.8.0-alpha - %d.%d FPS%s", fps10 / 10, fps10 % 10,
+                              g_speedup_held ? " [Speedup]" : "");
                     SetWindowTextA(hWnd, dbg);
                     fpsFrameCount = 0;
                     QueryPerformanceCounter(&fpsTimerStart);

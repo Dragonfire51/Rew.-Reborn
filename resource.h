@@ -108,4 +108,9 @@
 #define IDC_KEY_SELECT_3        1193
 #define IDC_KEY_SELECT_4        1194
 
+#define IDC_KEY_SPEEDUP_1       1201
+#define IDC_KEY_SPEEDUP_2       1202
+#define IDC_KEY_SPEEDUP_3       1203
+#define IDC_KEY_SPEEDUP_4       1204
+
 #endif /* RESOURCE_H */

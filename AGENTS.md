@@ -41,6 +41,24 @@ Compiling just the source (`-c`) is a fast syntax check.
   `ProductVersion` strings; both can be patched in place (same byte length).
 - Keep `resource.rc` line endings as CRLF.
 
+## Features (v0.8)
+- `Option > System` modes: Auto, Game Boy (DMG), Super Game Boy,
+  Game Boy + SGB Border, Game Boy Color + SGB Border and
+  Game Boy Color + Initial SGB Border. Stored in the ini as
+  `[System] Model` (0..5). The SGB modes render a 256x224 border around the
+  160x144 game viewport; the border is generated procedurally in
+  `GenerarBordeSgb` (no large data tables) and composited by `ComponerFrameSgb`.
+- Speedup Toggle: a mappable key (default Tab) that runs several frames per
+  tick while held (`SGB_SPEEDUP_MULT`), skipping the real-time sync.
+- Auto A / Auto B: mappable keys that toggle automatic fire on the A / B
+  buttons (`g_auto_fire_enabled`), for all 4 key profiles.
+- `MAX_ACTIONS` is 11 (UP, DOWN, LEFT, RIGHT, A, B, Select, Start, AutoA,
+  AutoB, Speedup). Adding an action requires: a row in `g_bindings`,
+  `g_action_names`, `kAllCtrlIds`, and matching `IDC_KEY_*` edit boxes plus
+  `RTEXT` labels in `IDD_KEY_SETTING`.
+- The Key Setting dialog captures Tab as a binding (no focus navigation) so
+  Speedup can be mapped to Tab.
+
 ## C++ style notes
 - Spanish user-facing strings.
 - Use octal escapes (`\341`) for accented characters inside string literals —
