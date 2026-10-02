@@ -651,7 +651,7 @@ public:
     int sgbPlayerCount = 2, sgbPlayerIndex = 0;
     std::array<uint8_t, 0x2000> sgbTileData{};  // 256 tiles x 32 bytes
     std::array<uint8_t, 0x800> sgbMapData{};    // tilemap 32x28 + fila extra
-    std::array<uint16_t, 48> sgbPalData{};      // paletas 4-6, RGB555
+    std::array<uint16_t, 64> sgbPalData{};      // paletas 0-3, RGB555
     bool sgbHasTiles = false, sgbHasMap = false;
     // Borde decodificado (256x224, RGB888).
     uint32_t sgbDecodedBorder[SGB_W * SGB_H] = {0};
@@ -679,15 +679,15 @@ public:
             for (int mx = 0; mx < 32; ++mx) {
                 uint16_t e = (uint16_t)(sgbMapData[(my * 32 + mx) * 2] |
                                         (sgbMapData[(my * 32 + mx) * 2 + 1] << 8));
-                int tile = e & 0x3FF;
-                int pal = (e >> 10) & 7;
-                if (pal < 4 || pal > 6) continue;   // solo paletas de borde
+                if (e & 0x300) continue;          // entrada no usada (transparente)
+                int tile = e & 0xFF;
+                int pal = (e >> 10) & 3;
                 bool xf = (e & 0x4000) != 0, yf = (e & 0x8000) != 0;
                 for (int py = 0; py < 8; ++py)
                     for (int px = 0; px < 8; ++px) {
                         int dx = mx * 8 + (xf ? 7 - px : px);
                         int dy = my * 8 + (yf ? 7 - py : py);
-                        sgbDecodedBorder[dy * SGB_W + dx] = sgbTilePixel(tile, px, py, pal - 4);
+                        sgbDecodedBorder[dy * SGB_W + dx] = sgbTilePixel(tile, px, py, pal);
                     }
             }
         sgbBorderFromPacket = true;
@@ -695,6 +695,10 @@ public:
     // Procesa un paquete completo (16 bytes).
     void sgbHandlePacket(const uint8_t* p) {
         uint8_t cmd = p[0] >> 3;
+#ifdef REW_SGB_TEST_HOOKS
+        { extern uint8_t g_sgb_pkts[64][16]; extern int g_sgb_cmd_n;
+          if (g_sgb_cmd_n < 64) { for (int i=0;i<16;i++) g_sgb_pkts[g_sgb_cmd_n][i]=p[i]; g_sgb_cmd_n++; } }
+#endif
         switch (cmd) {
             case 0x11: { // MLT_REQ: activa multijugador para deteccion por P1
                 int ctrl = p[1] & 3;
@@ -704,16 +708,16 @@ public:
                 joypSelect = (joypSelect & 0xCF) | 0x10;
                 return;
             }
-            case 0x13: { // CHR_TRN: 128 tiles (4 KiB) desde VRAM
+            case 0x13: { // CHR_TRN: 128 tiles (4 KiB) desde VRAM 0x8800
                 int base = (p[1] & 1) ? 128 * 32 : 0;
-                for (int i = 0; i < 128 * 32; ++i) sgbTileData[base + i] = vram[i];
+                for (int i = 0; i < 128 * 32; ++i) sgbTileData[base + i] = vram[0x800 + i];
                 sgbHasTiles = true;
                 break;
             }
-            case 0x14: { // PCT_TRN: tilemap (0x700) + paletas (0x60 bytes) desde VRAM
-                for (int i = 0; i < 0x700; ++i) sgbMapData[i] = vram[i];
-                for (int i = 0; i < 48; ++i)   // 3 paletas x 16 colores RGB555
-                    sgbPalData[i] = (uint16_t)(vram[0x800 + i * 2] | (vram[0x800 + i * 2 + 1] << 8));
+            case 0x14: { // PCT_TRN: tilemap + paletas desde VRAM 0x8800
+                for (int i = 0; i < 0x700; ++i) sgbMapData[i] = vram[0x800 + i];
+                for (int i = 0; i < 64; ++i)   // 4 paletas x 16 colores RGB555
+                    sgbPalData[i] = (uint16_t)(vram[0x1000 + i * 2] | (vram[0x1000 + i * 2 + 1] << 8));
                 sgbHasMap = true;
                 break;
             }
@@ -727,16 +731,17 @@ public:
         bool startPulse = (v == 0x00) && (sgbP1Prev != 0x00);
         // Un pulso de bit es cualquier bajada a 0x10/0x20 desde una fase de
         // reposo (0x00 tras el start, o 0x30), nunca desde otro pulso.
+        // En el protocolo ICD2, P14 LOW transmite un 1 y P15 LOW un 0.
         bool fromIdle = (sgbP1Prev == 0x00 || sgbP1Prev == 0x30);
-        bool bitLow  = (v == 0x10) && fromIdle;  // bit = 0
-        bool bitHigh = (v == 0x20) && fromIdle;  // bit = 1
+        bool bitOne = (v == 0x10) && fromIdle;
+        bool bitZero = (v == 0x20) && fromIdle;
         sgbP1Prev = v;
         if (startPulse) {
             sgbPhase = 1; sgbByteIndex = 0; sgbBitCount = 0; sgbBitBuf = 0;
             return;
         }
-        if (sgbPhase != 1 || (!bitLow && !bitHigh)) return;
-        if (bitHigh) sgbBitBuf |= (uint8_t)(1u << sgbBitCount);
+        if (sgbPhase != 1 || (!bitOne && !bitZero)) return;
+        if (bitOne) sgbBitBuf |= (uint8_t)(1u << sgbBitCount);
         if (++sgbBitCount == 8) {
             if (sgbByteIndex < 16) sgbPacket[sgbByteIndex] = sgbBitBuf;
             sgbByteIndex++;
@@ -817,8 +822,10 @@ public:
         mbc1Multicart = mbcType == 1 && rom.size() == 0x100000 &&
                         std::equal(rom.begin() + 0x104, rom.begin() + 0x134, rom.begin() + 0x40104);
         // Modo CGB: por cabecera del cartucho, salvo que el modo de sistema lo
-        // fuerce (DMG o los modos "Game Boy Color + ... SGB Border").
-        if (g_model_pref == SYS_DMG) isCgbMode = false;
+        // fuerce. Los modos SGB basados en DMG (Super Game Boy y
+        // Game Boy + SGB Border) deben arrancar en modo DMG para que el juego
+        // detecte el hardware SGB (firma C=0x14) y envie su borde.
+        if (g_model_pref == SYS_DMG || ModeIsSgb(g_model_pref)) isCgbMode = false;
         else if (ModeForcesCgb(g_model_pref)) isCgbMode = true;
         else isCgbMode = (rom[0x143] & 0x80) != 0;
         ext_ram.fill(0xFF);
@@ -1432,6 +1439,9 @@ public:
                 // P15 LOW->HIGH hace avanzar el joypad seleccionado (SGB).
                 if (sgbMultiPlayer && (prev & 0x20) == 0 && (joypSelect & 0x20))
                     sgbPlayerIndex = (sgbPlayerIndex + 1) % sgbPlayerCount;
+#ifdef REW_SGB_TEST_HOOKS
+                { extern void sgbRawLog(uint8_t); sgbRawLog(v); }
+#endif
                 sgbWriteP1(v);
                 return;
             }
@@ -2553,8 +2563,8 @@ void MostrarAcercaDe(HWND hWnd) {
         "  Game Boy, Game Boy Color + SGB Border y\n"
         "  Game Boy Color + Initial SGB Border\n"
         "- Bordes SGB reales: se decodifican los paquetes\n"
-        "  CHR_TRN/PCT_TRN de la ROM (Pokemon Yellow,\n"
-        "  Gold/Silver, etc.)\n"
+        "  CHR_TRN/PCT_TRN de la ROM (Pokemon Red/Gold,\n"
+        "  Yellow, Telefang, etc.)\n"
         "- Force SGB Border: muestra un borde aunque el\n"
         "  juego no incluya uno (estilos tipo Pokemon)\n"
         "- Bordes externos: <rom>.sgb / <rom>.bmp 256x224\n"
@@ -2788,10 +2798,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
         } else {
             if (g_rom_loaded && !g_emulation_paused) {
                 // Speedup: si la tecla esta pulsada se ejecutan varios frames
-                // sin esperar el sincronismo de tiempo real.
+                // sin esperar el sincronismo de tiempo real. Al soltar la tecla
+                // se corta el lote en curso para volver a la velocidad normal
+                // de inmediato.
                 int framesThisTick = g_speedup_held ? SGB_SPEEDUP_MULT : 1;
+                int framesRun = 0;
                 for (int f = 0; f < framesThisTick; ++f) {
+                    if (f > 0 && !g_speedup_held) break;
                     g_bus.runFrame();
+                    framesRun++;
                     if (!(g_bus.lcdc & 0x80)) memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
                     if (g_sgb_border_active) ComponerFrameSgb();
                     // [v0.4] Auto Fire
@@ -2823,7 +2838,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                     }
                 }
                 // ★ Contador de FPS (actualiza cada 1 segundo)
-                fpsFrameCount += framesThisTick;
+                fpsFrameCount += framesRun;
                 LARGE_INTEGER fpsNow;
                 QueryPerformanceCounter(&fpsNow);
                 double elapsedSec = (double)(fpsNow.QuadPart - fpsTimerStart.QuadPart) / qpcFreq.QuadPart;

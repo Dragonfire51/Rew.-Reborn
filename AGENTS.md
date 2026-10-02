@@ -63,9 +63,15 @@ Compiling just the source (`-c`) is a fast syntax check.
 - Real borders are decoded from the ROM: games send `CHR_TRN` ($13) and
   `PCT_TRN` ($14) packets over JOYP (`FF00`), and the emulator renders the
   result. `Bus::sgbWriteP1` receives the ICD2 bit protocol (start pulse =
-  `P14=P15=0`, bit 0 = `P14` low, bit 1 = `P15` low, 16 bytes LSB-first).
+  `P14=P15=0`; after that **P14 low (`0x10`) = bit 1, P15 low (`0x20`) = bit 0**,
+  16 bytes LSB-first, each pulse followed by a return to `0x30`).
+- The `_TRN` data is read from **VRAM `0x8800`** (i.e. `vram[0x800]`), *not*
+  `0x8000`: `CHR_TRN` takes `vram[0x800..0x17FF]` (128 tiles x 32 bytes),
+  `PCT_TRN` takes the tilemap from `vram[0x800..0xEFF]` and the palettes from
+  `vram[0x1000..0x107F]`. Reading from `0x8000` yields an empty border.
 - Border data format: 256 tiles x 32 bytes (4bpp, two interleaved GB tiles),
-  a 32x28 tilemap, and three 16-color RGB555 palettes (SNES palettes 4-6).
+  a 32x28 tilemap, and four 16-color RGB555 palettes. Map entry: tile number =
+  `e & 0xFF`, palette = `(e >> 10) & 3`, unused/transparent if `e & 0x300`.
   **Color index 0 of each palette is transparent** (this is what carves out the
   160x144 game window) — it is NOT bit 15 of the color.
 - SGB detection: in SGB modes (`ModeIsSgb`) `reset()` sets `C=0x14` so games

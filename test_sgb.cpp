@@ -14,7 +14,7 @@ static void sgbSendPacket(Bus& b, const uint8_t* p) {
     b.ioWrite(0xFF00, 0x00);            // pulso de start
     for (int i = 0; i < 16; ++i)
         for (int bit = 0; bit < 8; ++bit) {
-            b.ioWrite(0xFF00, ((p[i] >> bit) & 1) ? 0x20 : 0x10);
+            b.ioWrite(0xFF00, ((p[i] >> bit) & 1) ? 0x10 : 0x20);
             b.ioWrite(0xFF00, 0x30);
         }
     b.ioWrite(0xFF00, 0x10);            // stop bit = 0
@@ -24,11 +24,11 @@ static void sgbSendPacket(Bus& b, const uint8_t* p) {
 int main() {
     Bus& b = g_bus;
 
-    // --- Prepara datos de tiles en VRAM (tile 1 = color index 1 solido) ------
+    // --- Prepara datos de tiles en VRAM 0x8800 (tile 1 = color index 1) ------
     b.vram.fill(0);
     for (int row = 0; row < 8; ++row) {
-        b.vram[32 + row * 2] = 0xFF;     // plano bits 0-1 -> bit0 = 1
-        b.vram[32 + row * 2 + 1] = 0x00; // plano bits 2-3 -> bit1 = 0
+        b.vram[0x800 + 32 + row * 2] = 0xFF;     // plano bits 0-1 -> bit0 = 1
+        b.vram[0x800 + 32 + row * 2 + 1] = 0x00; // plano bits 2-3 -> bit1 = 0
     }
     uint8_t chr[16] = {0}; chr[0] = 0x99; chr[1] = 0x00;   // $13 CHR_TRN, mitad 0
     sgbSendPacket(b, chr);
@@ -36,18 +36,18 @@ int main() {
 
     // --- Datos de tilemap + paletas, luego PCT_TRN ---------------------------
     b.vram.fill(0);
-    // Entrada (0,0): tile 1, paleta 4  => e = 1 | (4<<10)
-    uint16_t e = 1 | (4 << 10);
-    b.vram[0] = e & 0xFF; b.vram[1] = e >> 8;
-    // Paleta 4 (la primera del borde), color 1 = rojo puro (RGB555 0x001F)
-    size_t palOff = 0x800 + 1 * 2;
+    // Entrada (0,0): tile 1, paleta 0  => e = 1 | (0<<10)
+    uint16_t e = 1 | (0 << 10);
+    b.vram[0x800] = e & 0xFF; b.vram[0x801] = e >> 8;
+    // Paleta 0 (la primera del borde), color 1 = rojo puro (RGB555 0x001F)
+    size_t palOff = 0x1000 + 1 * 2;
     b.vram[palOff] = 0x1F; b.vram[palOff + 1] = 0x00;
     uint8_t pct[16] = {0}; pct[0] = 0xA1;                  // $14 PCT_TRN
     sgbSendPacket(b, pct);
 
     check(b.sgbHasMap, "PCT_TRN carga el tilemap");
     check(b.sgbBorderFromPacket, "el borde se marca como recibido");
-    check(b.sgbDecodedBorder[0] == 0xF80000u, "pixel (0,0) es rojo (paleta 4, color 1)");
+    check(b.sgbDecodedBorder[0] == 0xF80000u, "pixel (0,0) es rojo (paleta 0, color 1)");
     check(b.sgbDecodedBorder[8] == 0x000000u, "pixel (8,0) queda transparente");
 
     // --- Un paquete desconocido no debe romper nada --------------------------
@@ -68,7 +68,7 @@ int main() {
     uint8_t mlt[16] = {0}; mlt[0] = 0x89; mlt[1] = 0x01;   // $11 MLT_REQ, 2P
     for (int i = 0; i < 16; ++i)
         for (int bit = 0; bit < 8; ++bit) {
-            b.ioWrite(0xFF00, ((mlt[i] >> bit) & 1) ? 0x20 : 0x10);
+            b.ioWrite(0xFF00, ((mlt[i] >> bit) & 1) ? 0x10 : 0x20);
             b.ioWrite(0xFF00, 0x30);
         }
     b.ioWrite(0xFF00, 0x10); b.ioWrite(0xFF00, 0x30);
