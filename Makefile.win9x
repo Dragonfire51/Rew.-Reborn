@@ -1,0 +1,50 @@
+# ============================================================================
+# Makefile.win9x - Build del port para Windows 95/98/98SE/ME y Windows de 32
+# bits (binario i686, PE32). Rama: windows-9x-32bit.
+#
+# Toolchain: i686-w64-mingw32 (MinGW-w64, 32-bit).
+#   Debian/Ubuntu: apt-get install g++-mingw-w64-i686 binutils-mingw-w64-i686
+#
+# El ejecutable resultante es PE32 (i386). Un PE32+ (64-bit) NO arranca en
+# Windows 9x. -DREW_WIN9X baja _WIN32_WINNT a 0x0400 y mapea SetWindowLongPtrA
+# / GetWindowLongPtrA a las variantes *LongA, que son las unicas que expone
+# USER32 en Windows 9x.
+#
+# Uso:
+#   make -f Makefile.win9x           # compila rew_reborn_32.exe
+#   make -f Makefile.win9x test      # compila y ejecuta las pruebas del nucleo
+#   make -f Makefile.win9x clean
+# ============================================================================
+
+CXX      := i686-w64-mingw32-g++
+WINDRES  := i686-w64-mingw32-windres
+HOSTCXX  ?= g++
+
+SRC      := Rew. Reborn.cpp
+SRC_DEP  := Rew.\ Reborn.cpp
+RC       := resource.rc
+RES      := resource32.res.o
+EXE      := rew_reborn_32.exe
+
+CXXFLAGS := -std=c++17 -DREW_WIN9X -O2
+LDFLAGS  := -mwindows -static -static-libgcc -static-libstdc++
+LIBS     := -lwinmm -lcomdlg32 -lcomctl32 -lgdi32 -luser32
+
+.PHONY: all test clean
+
+all: $(EXE)
+
+$(RES): $(RC) resource.h
+	$(WINDRES) $(RC) -o $(RES)
+
+$(EXE): $(SRC_DEP) $(RES) resource.h
+	$(CXX) $(CXXFLAGS) "$(SRC)" "$(RES)" -o "$(EXE)" $(LDFLAGS) $(LIBS)
+
+# Las pruebas del nucleo se compilan nativas (REW_HEADLESS) con el compilador
+# del host; no dependen del API de Windows.
+test:
+	$(HOSTCXX) -std=c++17 -DREW_HEADLESS -o test_sgb_host test_sgb.cpp
+	./test_sgb_host
+
+clean:
+	rm -f $(EXE) $(RES) test_sgb_host

@@ -1,5 +1,10 @@
 // ============================================================================
 // Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
+// RAMA windows-9x-32bit: port para Windows 95/98/98SE/ME y Windows de 32 bits
+//   (binario i686). Compila con -DREW_WIN9X (ver Makefile.win9x). En 9x no
+//   existen SetWindowLongPtrA/GetWindowLongPtrA (solo NT), asi que se mapean a
+//   SetWindowLongA/GetWindowLongA; el nivel de API baja a _WIN32_WINNT 0x0400.
+//   Requiere 32 bits: un PE32+ (64-bit) no arranca en Windows 9x.
 // v0.8.3-alpha: corrige el tono del audio (la musica sonaba mas grave).
 //   - waveOutSetPlaybackRate espera un multiplicador de punto fijo (1.0 =
 //     0x10000), no una frecuencia en Hz; se pasaban 44100/176400 y el tono
@@ -31,6 +36,15 @@
 // Compilar con -DREW_HEADLESS para usar sólo el núcleo (tests).
 // ============================================================================
 #ifndef REW_HEADLESS
+// Objetivo Windows 9x/ME y Windows de 32 bits: fija el nivel de API a Win95/NT4
+// y mapea las funciones "pointer-width" de ventana a sus equivalentes de 32
+// bits. En 9x USER32 solo expone SetWindowLongA/GetWindowLongA (las variantes
+// *Ptr son exclusivas de NT), y en 32 bits LONG_PTR == LONG, así que el cast es
+// seguro. En 64 bits se mantienen las funciones reales de USER32.
+#ifdef REW_WIN9X
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0400
+#endif
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
 #endif
@@ -39,6 +53,14 @@
 #include <commdlg.h>
 #include <commctrl.h>
 #include "resource.h"
+#ifdef REW_WIN9X
+#ifndef _WIN64
+#define SetWindowLongPtrA SetWindowLongA
+#define SetWindowLongPtrW SetWindowLongW
+#define GetWindowLongPtrA GetWindowLongA
+#define GetWindowLongPtrW GetWindowLongW
+#endif
+#endif
 #endif
 #include <cstdint>
 #include <cstdio>
@@ -2748,7 +2770,8 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
         "Rew. Reborn v0.8.3-alpha\n"
-        "Emulador Game Boy / Game Boy Color\n\n"
+        "Emulador Game Boy / Game Boy Color\n"
+        "Port Windows 9x/ME y Windows de 32 bits (i686)\n\n"
         "- Modos Super Game Boy con borde (256x224):\n"
         "  Game Boy, Game Boy Color + SGB Border y\n"
         "  Game Boy Color + Initial SGB Border\n"

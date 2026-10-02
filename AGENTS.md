@@ -29,6 +29,22 @@ against an older MinGW runtime fails with "No se encuentra el punto de
 entrada del procedimiento _ZSt28__throw_bad_array_new_lengthv".
 Compiling just the source (`-c`) is a fast syntax check.
 
+## Windows 9x/ME port (branch `windows-9x-32bit`)
+`main` builds a **PE32+ (64-bit)** exe, which does not load on Windows
+95/98/98SE/ME. This branch adds a **32-bit (i686, PE32)** port:
+```
+sudo apt-get install -y g++-mingw-w64-i686 binutils-mingw-w64-i686
+make -f Makefile.win9x          # -> rew_reborn_32.exe (PE32/i386)
+make -f Makefile.win9x test     # core tests (host build, REW_HEADLESS)
+```
+- `-DREW_WIN9X` sets `_WIN32_WINNT 0x0400` and maps `SetWindowLongPtrA` /
+  `GetWindowLongPtrA` to `SetWindowLongA` / `GetWindowLongA`. Windows 9x
+  USER32 exposes only the `*LongA` variants (`*Ptr` is NT-only); on 32-bit
+  `LONG_PTR == LONG`, so the mapping is safe. The 64-bit path is unchanged.
+- The binary must be 32-bit; a PE32+ image cannot run on 9x regardless of API.
+- Real testing needs Win9x/ME hardware or a VM (86Box, PCem, VirtualBox/VMware).
+- Runtime is cycle-accurate (M-cycle); may be tight on period hardware.
+
 ## Version / release conventions
 - Version string: `vX.Y.Z-alpha`, used in three places in `Rew. Reborn.cpp`:
   the About dialog (`MostrarAcercaDe`), the `CreateWindowExA` window title, and
