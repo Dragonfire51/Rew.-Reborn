@@ -1,5 +1,10 @@
 // ============================================================================
 // Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
+// v0.8.3-alpha: corrige el tono del audio (la musica sonaba mas grave).
+//   - waveOutSetPlaybackRate espera un multiplicador de punto fijo (1.0 =
+//     0x10000), no una frecuencia en Hz; se pasaban 44100/176400 y el tono
+//     bajaba tanto a velocidad normal como en speedup. Ahora se usa
+//     MultiplicadorTasaAudio (44100 -> 0x10000, 176400 -> 0x40000).
 // v0.8.2-alpha: bordes reales en los modos CGB+SGB, nombre de ROM en el
 //   titulo y Speedup sincronizado con el audio.
 //   - Los modos "Game Boy Color + SGB Border" y "... + Initial SGB Border"
@@ -90,7 +95,7 @@ bool g_sgb_capture_pending = false;
 uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
 int  g_sgb_captured_count = 0;
 char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
-char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.8.2-alpha";
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.8.3-alpha";
 // Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
 // modo que el sonido conserva su tono mientras la emulacion acelera. Si el
 // dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
@@ -1914,6 +1919,16 @@ void ComponerFrameSgb() {
             g_sgbBuffer[(SGB_VY + y) * SGB_W + (SGB_VX + x)] = g_bus.frameBuf[y * GB_WIDTH + x];
 }
 
+// Multiplicador de punto fijo que espera waveOutSetPlaybackRate: la palabra
+// alta es la parte entera y la baja la fraccion (0x8000 = 1/2, 0x10000 = 1.0,
+// 0x40000 = 4.0). NO es una frecuencia en Hz: pasar 44100/176400 directamente
+// se interpreta como multiplicadores de ~0.67x / 2.69x y baja el tono. Se
+// calcula como hz/hzBase para que hz == hzBase de exactamente 1.0.
+uint32_t MultiplicadorTasaAudio(uint32_t hz, uint32_t hzBase) {
+    if (hzBase == 0) return 0x10000;
+    return (uint32_t)(((uint64_t)hz << 16) / hzBase);
+}
+
 #ifndef REW_HEADLESS
 int g_active_slot = 0;
 bool g_emulation_paused = false;
@@ -2128,13 +2143,16 @@ void IniciarAudio(HWND hWnd) {
     g_waveOutReady = true;
 }
 
-// Ajusta la frecuencia de reproduccion de waveOut para que el audio siga a la
+// Ajusta la velocidad de reproduccion de waveOut para que el audio siga a la
 // emulacion durante el speedup. Devuelve false si el dispositivo no admite el
 // cambio (el llamador silencia entonces el audio durante el speedup).
 bool AplicarTasaSpeedup(bool activo) {
     if (!g_waveOutReady || !g_hWaveOut) return false;
     if (!g_speedup_rate_supported) return false;
-    DWORD target = activo ? (DWORD)(APU::SAMPLE_RATE * SGB_SPEEDUP_MULT) : (DWORD)APU::SAMPLE_RATE;
+    // waveOutSetPlaybackRate usa un multiplicador de punto fijo (1.0 = 0x10000),
+    // no una frecuencia: pasarle Hz directos bajaba el tono a velocidad normal.
+    DWORD target = activo ? MultiplicadorTasaAudio(APU::SAMPLE_RATE * SGB_SPEEDUP_MULT, APU::SAMPLE_RATE)
+                          : MultiplicadorTasaAudio(APU::SAMPLE_RATE, APU::SAMPLE_RATE);
     DWORD cur = 0;
     if (waveOutGetPlaybackRate(g_hWaveOut, &cur) == MMSYSERR_NOERROR && cur == target) {
         g_speedup_rate_active = activo;
@@ -2729,7 +2747,7 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v0.8.2-alpha\n"
+        "Rew. Reborn v0.8.3-alpha\n"
         "Emulador Game Boy / Game Boy Color\n\n"
         "- Modos Super Game Boy con borde (256x224):\n"
         "  Game Boy, Game Boy Color + SGB Border y\n"
@@ -2950,7 +2968,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     RECT rc = {0, 0, (g_sgb_border_active ? SGB_W : GB_WIDTH) * g_window_scale,
                (g_sgb_border_active ? SGB_H : GB_HEIGHT) * g_window_scale};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
-    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.8.2-alpha", WS_OVERLAPPEDWINDOW,
+    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.8.3-alpha", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, hInst, NULL);
     ShowWindow(hWnd, nShow); UpdateWindow(hWnd);
 

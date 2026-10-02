@@ -84,6 +84,13 @@ int main() {
     b.reset();
     check(!b.sgbBorderFromPacket && !b.sgbHasTiles, "reset limpia el estado SGB");
 
+    // --- Multiplicador de velocidad de audio (waveOutSetPlaybackRate) --------
+    // 1.0 = 0x10000; 4x = 0x40000. No son Hz.
+    check(MultiplicadorTasaAudio(44100, 44100) == 0x10000, "tasa de audio normal = 1.0 (0x10000)");
+    check(MultiplicadorTasaAudio(44100 * 4, 44100) == 0x40000, "tasa de speedup 4x = 0x40000");
+    check(MultiplicadorTasaAudio(22050, 44100) == 0x8000, "mitad de tasa = 0.5 (0x8000)");
+    check(MultiplicadorTasaAudio(88200, 44100) == 0x20000, "doble de tasa = 2.0 (0x20000)");
+
     std::printf(g_fail ? "\nRESULTADO: %d FALLOS\n" : "\nRESULTADO: OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

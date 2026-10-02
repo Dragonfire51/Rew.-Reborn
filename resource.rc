@@ -129,8 +129,8 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 205, 192, 50, 14
 	END
 1 VERSIONINFO
-FILEVERSION     0,8,2,0
-PRODUCTVERSION  0,8,2,0
+FILEVERSION     0,8,3,0
+PRODUCTVERSION  0,8,3,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS__WINDOWS32
@@ -143,7 +143,7 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Rew. Reborn"
             VALUE "FileDescription",  "Game Boy / Game Boy Color Emulator"
-            VALUE "FileVersion",      "0.8.2.0"
+            VALUE "FileVersion",      "0.8.3.0"
             VALUE "InternalName",     "rew_reborn"
             VALUE "OriginalFilename", "rew_reborn.exe"
             VALUE "ProductName",      "Rew. Reborn"

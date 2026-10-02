@@ -96,7 +96,7 @@ Compiling just the source (`-c`) is a fast syntax check.
 - Save-state version is 9 (`kStateVersion`); SGB decoder state is serialized.
 
 ## Window title
-- `g_window_base_title` is the base ("Rew. Reborn v0.8.2-alpha"); the loaded
+- `g_window_base_title` is the base ("Rew. Reborn v0.8.3-alpha"); the loaded
   cartridge is shown as `"<base> - <ROM> - <FPS>"`. The ROM name comes from the
   header title (`0x134..0x143`, `EstablecerNombreRom`) or the filename.
 - The title is refreshed both on ROM load/free (`ActualizarTituloVentana`) and
@@ -108,6 +108,12 @@ Compiling just the source (`-c`) is a fast syntax check.
   raises the device rate to `M x 44100` while held; if unsupported,
   `g_speedup_audio_muted` silences audio for the duration instead of
   desynchronising. `EnviarFrameAudio` drops queued chunks (`>2`) during speedup.
+- **Playback-rate units**: `waveOutSetPlaybackRate` takes a *fixed-point
+  multiplier*, not Hz — high word = integer part, low word = fraction
+  (`0x10000` = 1.0, `0x40000` = 4.0, `0x8000` = 0.5). Always convert with
+  `MultiplicadorTasaAudio(hz, hzBase)`. Passing raw Hz (44100 / 176400) is read
+  as multipliers ~0.67x / 2.69x, which made normal-speed music play too low
+  (v0.8.2 bug).
 
 ## C++ style notes
 - Spanish user-facing strings.
