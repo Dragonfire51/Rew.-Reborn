@@ -5,6 +5,9 @@
 # Toolchain: i686-w64-mingw32 (MinGW-w64, 32-bit).
 #   Debian/Ubuntu: apt-get install g++-mingw-w64-i686 binutils-mingw-w64-i686
 #
+# Se usa la variante de hilos *-win32 del compilador (no la *-posix): la posix
+# deja un import de TryEnterCriticalSection (NT4+), inexistente en Windows 9x.
+#
 # El ejecutable resultante es PE32 (i386). Un PE32+ (64-bit) NO arranca en
 # Windows 9x. -DREW_WIN9X baja _WIN32_WINNT a 0x0400 y mapea SetWindowLongPtrA
 # / GetWindowLongPtrA a las variantes *LongA, que son las unicas que expone
@@ -16,7 +19,7 @@
 #   make -f Makefile.win9x clean
 # ============================================================================
 
-CXX      := i686-w64-mingw32-g++
+CXX      := i686-w64-mingw32-g++-win32
 WINDRES  := i686-w64-mingw32-windres
 HOSTCXX  ?= g++
 
@@ -26,7 +29,10 @@ RC       := resource.rc
 RES      := resource32.res.o
 EXE      := rew_reborn_32.exe
 
-CXXFLAGS := -std=c++17 -DREW_WIN9X -O2
+# -fno-exceptions y -fno-threadsafe-statics evitan enlazar el runtime de
+# excepciones/guardas de libstdc++, que importa GetThreadId (Vista+) y
+# TryEnterCriticalSection (NT4+). Ver los shims en Rew. Reborn.cpp.
+CXXFLAGS := -std=c++17 -DREW_WIN9X -O2 -fno-exceptions -fno-threadsafe-statics
 LDFLAGS  := -mwindows -static -static-libgcc -static-libstdc++
 LIBS     := -lwinmm -lcomdlg32 -lcomctl32 -lgdi32 -luser32
 

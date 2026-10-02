@@ -32,6 +32,13 @@ make -f Makefile.win9x test     # pruebas del núcleo (CHR_TRN/PCT_TRN, tasa de 
 ### Estado / limitaciones
 - **Requiere 32 bits**: la clave es que sea PE32; un binario de 64 bits no
   funciona en 9x.
+- **Sin imports posteriores a 9x**: el binario final no importa `GetThreadId`
+  (Vista+), `TryEnterCriticalSection` (NT4+) ni las variables de condición de
+  Vista. Para lograrlo se evita `<fstream>`/`<iostream>` (E/S con `FILE*`), se
+  compila con `-fno-exceptions -fno-threadsafe-statics` usando la variante
+  `*-win32` del compilador, y se aportan `operator new/delete` y los
+  `__gthr_win32_mutex_*` (ver AGENTS.md). KERNEL32 sólo expone APIs de la era
+  Win95/NT4.
 - Las pruebas de ejecución real en Windows 9x/ME deben hacerse en una máquina
   o VM (86Box, PCem, VirtualBox/VMware con imagen 9x).
 - Rendimiento: el emulador es ciclo-a-ciclo (M-cycle); en hardware de la época

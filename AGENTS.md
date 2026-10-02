@@ -41,6 +41,20 @@ make -f Makefile.win9x test     # core tests (host build, REW_HEADLESS)
   `GetWindowLongPtrA` to `SetWindowLongA` / `GetWindowLongA`. Windows 9x
   USER32 exposes only the `*LongA` variants (`*Ptr` is NT-only); on 32-bit
   `LONG_PTR == LONG`, so the mapping is safe. The 64-bit path is unchanged.
+- **Post-9x imports**: the stock MinGW-w64 32-bit binary imported
+  `KERNEL32!GetThreadId` (Vista+), which aborts startup on 9x with
+  "el archivo ... está vinculado a una exportación de KERNEL32.DLL:GetThreadId
+  que no existe". Root cause: the libstdc++ exception runtime pulls libgcc's
+  `gthr-win32.o`, and `std::locale`/`std::string` pull the Vista+ condition
+  variables. Fixes (all guarded so 64-bit is untouched):
+  - no `<fstream>`/`<iostream>`: use `FILE*` (`FOut`/`FIn`/`LeerFichero`),
+    which avoids `std::locale` and its `__gthr_win32_cond_*` imports.
+  - build with `-fno-exceptions -fno-threadsafe-statics` (no local `static`
+    guards, no exception tables) and the `*-win32` compiler variant (the
+    `*-posix` one leaves `TryEnterCriticalSection`, NT4+).
+  - provide `operator new`/`delete` and `__gthr_win32_mutex_*` shims so
+    `eh_alloc.o`/`gthr-win32.o` are not linked (GetThreadId/TryEnterCriticalSection).
+  Result: zero post-9x imports; KERNEL32 imports are all Win95/NT4-era.
 - The binary must be 32-bit; a PE32+ image cannot run on 9x regardless of API.
 - Real testing needs Win9x/ME hardware or a VM (86Box, PCem, VirtualBox/VMware).
 - Runtime is cycle-accurate (M-cycle); may be tight on period hardware.

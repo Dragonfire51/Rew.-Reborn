@@ -64,13 +64,79 @@
 #endif
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <array>
-#include <fstream>
 #include <string>
 #include <cstring>
 #include <ctime>
 #include <algorithm>
+
+// Operadores new/delete propios. libstdc++'s eh_alloc.o (allocador de
+// excepciones) arrastra libgcc gthr-win32.o, que importa GetThreadId (Vista+)
+// y TryEnterCriticalSection (NT4+), inexistentes en Windows 9x/ME. Al aportar
+// estos operadores no se enlazan eh_alloc.o/new_op.o/del_ops.o y el binario
+// deja de importar esas funciones.
+#ifdef REW_WIN9X
+void* operator new(std::size_t n) { void* p = std::malloc(n ? n : 1); return p; }
+void* operator new[](std::size_t n) { return operator new(n); }
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept { return std::malloc(n ? n : 1); }
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept { return std::malloc(n ? n : 1); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+
+// Sustituye libgcc's gthr-win32.o, que importa GetThreadId (Vista+) y
+// TryEnterCriticalSection (NT4+), inexistentes en Windows 9x/ME. En este
+// enlace su unico consumidor es eh_alloc.o (el mutex del allocador de
+// excepciones); aportando estas cuatro funciones no se enlaza gthr-win32.o.
+// Los tipos reales son CRITICAL_SECTION*; se usa void* para evitar depender de
+// la cabecera interna gthr-win32.h. InitializeCriticalSection/Enter/Leave/
+// Delete existen desde Windows 95.
+extern "C" void __gthr_win32_mutex_init_function(void* m) { InitializeCriticalSection((CRITICAL_SECTION*)m); }
+extern "C" void __gthr_win32_mutex_lock(void* m) { EnterCriticalSection((CRITICAL_SECTION*)m); }
+extern "C" void __gthr_win32_mutex_unlock(void* m) { LeaveCriticalSection((CRITICAL_SECTION*)m); }
+extern "C" int  __gthr_win32_mutex_destroy(void* m) { DeleteCriticalSection((CRITICAL_SECTION*)m); return 0; }
+#endif
+
+// E/S de ficheros con FILE* en lugar de <fstream>. En este port (Windows
+// 9x/ME) se evita <fstream>/<iostream> a proposito: arrastran las guardas de
+// inicializacion de std::locale (guard.o -> __gthr_win32_cond_init_function),
+// que importan InitializeConditionVariable/SleepConditionVariableCS/GetThreadId
+// (solo Vista+). Con FILE* el binario no importa ninguna API posterior a 9x.
+struct FOut {
+    FILE* f = nullptr;
+    bool fail = false;
+    explicit FOut(const char* path) { f = fopen(path, "wb"); }
+    ~FOut() { if (f) fclose(f); }
+    bool ok() const { return f != nullptr; }
+    bool good() const { return f != nullptr && !fail && !ferror(f); }
+    void write(const void* p, size_t n) { if (f && fwrite(p, 1, n, f) != n) fail = true; }
+};
+struct FIn {
+    FILE* f = nullptr;
+    bool fail = false;
+    explicit FIn(const char* path) { f = fopen(path, "rb"); }
+    ~FIn() { if (f) fclose(f); }
+    bool ok() const { return f != nullptr; }
+    bool good() const { return f != nullptr && !fail && !ferror(f); }
+    void read(void* p, size_t n) { if (f && !fail && fread(p, 1, n, f) != n) fail = true; }
+};
+// Lee un fichero entero a un vector (0 bytes si no existe).
+inline std::vector<uint8_t> LeerFichero(const char* path) {
+    std::vector<uint8_t> v;
+    FILE* f = fopen(path, "rb");
+    if (!f) return v;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n > 0) { v.resize((size_t)n); if (fread(v.data(), 1, (size_t)n, f) != (size_t)n) v.clear(); }
+    fclose(f);
+    return v;
+}
 
 #ifndef REW_HEADLESS
 // MAX_PATH lo aporta windows.h
@@ -858,9 +924,8 @@ public:
 
     // ================================================================ carga
     bool loadRom(const std::string& path) {
-        std::ifstream fi(path, std::ios::binary);
-        if (!fi) return false;
-        std::vector<uint8_t> data((std::istreambuf_iterator<char>(fi)), std::istreambuf_iterator<char>());
+        std::vector<uint8_t> data = LeerFichero(path.c_str());
+        if (data.empty()) return false;
         if (data.size() < 0x150) return false;
         size_t sz = 0x8000;
         while (sz < data.size()) sz <<= 1;
@@ -1969,9 +2034,7 @@ bool g_audio_enabled = true;
 // Tambien se acepta un BMP de 256x224 sin comprimir (24 bpp).
 // ---------------------------------------------------------------------------
 static bool CargarBordeSgbExterno(const char* path, uint32_t* out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<uint8_t> d = LeerFichero(path);
     if (d.size() < 16) return false;
     if (d[0] == 'S' && d[1] == 'G' && d[2] == 'B' && d[3] == 'R') {
         uint32_t w = d[4] | (d[5] << 8) | (d[6] << 16) | ((uint32_t)d[7] << 24);
@@ -2338,20 +2401,18 @@ void GuardarSramCartucho() {
     CreateDirectoryA(".\\gbsave", NULL);
     char szPath[MAX_PATH];
     wsprintfA(szPath, ".\\gbsave\\%s.sav", g_rom_base_name);
-    std::ofstream f(szPath, std::ios::binary);
-    if (!f) return;
+    FOut f(szPath);
+    if (!f.ok()) return;
     std::vector<uint8_t> data = g_bus.batteryData();
-    f.write((const char*)data.data(), (std::streamsize)data.size());
+    f.write(data.data(), data.size());
 }
 
 void CargarSramCartucho() {
     if (!g_rom_loaded) return;
     char szPath[MAX_PATH];
     wsprintfA(szPath, ".\\gbsave\\%s.sav", g_rom_base_name);
-    std::ifstream f(szPath, std::ios::binary);
-    if (!f) return;   // no existe: juego nuevo
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (data.empty()) return;
+    std::vector<uint8_t> data = LeerFichero(szPath);
+    if (data.empty()) return;   // no existe: juego nuevo
     g_bus.loadBatteryData(data);
 }
 
@@ -2677,30 +2738,30 @@ void ActualizarMenuDeEstados(HWND hWnd) {
 // State save/load (v4)
 // ============================================================================
 struct StateWriter {
-    std::ofstream& f;
-    template <class T> void operator()(const T& v) { f.write((const char*)&v, sizeof(T)); }
+    FOut& f;
+    template <class T> void operator()(const T& v) { f.write(&v, sizeof(T)); }
 };
 struct StateReader {
-    std::ifstream& f;
-    template <class T> void operator()(T& v) { f.read((char*)&v, sizeof(T)); }
+    FIn& f;
+    template <class T> void operator()(T& v) { f.read(&v, sizeof(T)); }
 };
 
 bool saveStateToFile(const std::string& path) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) return false;
+    FOut f(path.c_str());
+    if (!f.ok()) return false;
     uint32_t magic = Bus::kStateMagic, version = Bus::kStateVersion;
     uint32_t romSize = (uint32_t)g_bus.rom.size();
-    f.write((char*)&magic, 4); f.write((char*)&version, 4); f.write((char*)&romSize, 4);
+    f.write(&magic, 4); f.write(&version, 4); f.write(&romSize, 4);
     StateWriter w{f};
     g_bus.serialize(w);
     return f.good();
 }
 
 bool loadStateFromFile(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
+    FIn f(path.c_str());
+    if (!f.ok()) return false;
     uint32_t magic = 0, version = 0, romSize = 0;
-    f.read((char*)&magic, 4); f.read((char*)&version, 4); f.read((char*)&romSize, 4);
+    f.read(&magic, 4); f.read(&version, 4); f.read(&romSize, 4);
     if (!f.good() || magic != Bus::kStateMagic || version != Bus::kStateVersion || romSize != g_bus.rom.size())
         return false;
     static Bus tmp;
