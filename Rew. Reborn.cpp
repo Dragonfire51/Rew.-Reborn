@@ -1,6 +1,6 @@
 // ============================================================================
 // Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
-// v0.8.0-alpha: modos Super Game Boy con borde y Speedup Toggle.
+// v0.8.1-alpha: modos Super Game Boy con borde y Speedup Toggle.
 //   - System: Auto, Game Boy (DMG), Super Game Boy, Game Boy + SGB Border,
 //     Game Boy Color + SGB Border y Game Boy Color + Initial SGB Border.
 //   - El borde SGB (256x224) se dibuja alrededor del area de juego 160x144.
@@ -2547,7 +2547,7 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v0.8.0-alpha\n"
+        "Rew. Reborn v0.8.1-alpha\n"
         "Emulador Game Boy / Game Boy Color\n\n"
         "- Modos Super Game Boy con borde (256x224):\n"
         "  Game Boy, Game Boy Color + SGB Border y\n"
@@ -2761,7 +2761,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     RECT rc = {0, 0, (g_sgb_border_active ? SGB_W : GB_WIDTH) * g_window_scale,
                (g_sgb_border_active ? SGB_H : GB_HEIGHT) * g_window_scale};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
-    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.8.0-alpha", WS_OVERLAPPEDWINDOW,
+    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.8.1-alpha", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, hInst, NULL);
     ShowWindow(hWnd, nShow); UpdateWindow(hWnd);
 
@@ -2831,7 +2831,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                     double fps = fpsFrameCount / elapsedSec;
                     int fps10 = (int)(fps * 10);  // un decimal
                     char dbg[80];
-                    wsprintfA(dbg, "Rew. Reborn v0.8.0-alpha - %d.%d FPS%s", fps10 / 10, fps10 % 10,
+                    wsprintfA(dbg, "Rew. Reborn v0.8.1-alpha - %d.%d FPS%s", fps10 / 10, fps10 % 10,
                               g_speedup_held ? " [Speedup]" : "");
                     SetWindowTextA(hWnd, dbg);
                     fpsFrameCount = 0;
