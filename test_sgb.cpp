@@ -91,6 +91,40 @@ int main() {
     check(MultiplicadorTasaAudio(22050, 44100) == 0x8000, "mitad de tasa = 0.5 (0x8000)");
     check(MultiplicadorTasaAudio(88200, 44100) == 0x20000, "doble de tasa = 2.0 (0x20000)");
 
+    // --- Efectos de audio (submenu Audio) -----------------------------------
+    check(VolumenIndice(0) == 0 && VolumenIndice(100) == 3 && VolumenIndice(200) == 5,
+          "VolumenIndice mapea 0/100/200 a 0/3/5");
+
+    {   // Volumen 200% duplica la senal.
+        AudioFx fx; fx.mode = AUDIO_FX_NONE; fx.volume = 200;
+        int16_t buf[2] = {1000, -1000};
+        fx.process(buf, 2);
+        check(buf[0] == 2000 && buf[1] == -2000, "volumen 200% duplica la senal");
+    }
+    {   // Volumen 0% silencia.
+        AudioFx fx; fx.mode = AUDIO_FX_NONE; fx.volume = 0;
+        int16_t buf[2] = {1000, -1000};
+        fx.process(buf, 2);
+        check(buf[0] == 0 && buf[1] == 0, "volumen 0% silencia");
+    }
+    {   // LPF1 atenua un escalon (primer valor < entrada) y converge.
+        AudioFx fx; fx.mode = AUDIO_FX_LPF1; fx.volume = 100;
+        int16_t buf[2] = {1000, 1000};
+        fx.process(buf, 2);
+        check(buf[0] < 1000 && buf[0] > 0, "LPF1 suaviza el primer valor");
+        for (int i = 0; i < 200; ++i) { int16_t b[2] = {1000, 1000}; fx.process(b, 2); }
+        int16_t b[2] = {1000, 1000}; fx.process(b, 2);
+        check(b[0] >= 990, "LPF1 converge al valor de entrada");
+    }
+    {   // Reverb: un impulso deja cola en muestras posteriores.
+        AudioFx fx; fx.mode = AUDIO_FX_REVERB; fx.volume = 100;
+        int16_t imp[2] = {10000, 10000};
+        fx.process(imp, 2);
+        int tail = 0;
+        for (int i = 0; i < 4096; ++i) { int16_t b[2] = {0, 0}; fx.process(b, 2); if (b[0] != 0) tail++; }
+        check(tail > 0, "Reverb deja cola tras el impulso");
+    }
+
     std::printf(g_fail ? "\nRESULTADO: %d FALLOS\n" : "\nRESULTADO: OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

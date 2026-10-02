@@ -55,6 +55,13 @@ Compiling just the source (`-c`) is a fast syntax check.
   tick while held (`SGB_SPEEDUP_MULT`), skipping the real-time sync.
 - Auto A / Auto B: mappable keys that toggle automatic fire on the A / B
   buttons (`g_auto_fire_enabled`), for all 4 key profiles.
+- `Option > Audio` submenu (runtime menu IDs, `CrearMenusExtra`):
+  `Sonido On`/`Sonido Off` (the master audio toggle, formerly `ID_AUDIO_TOGGLE`
+  40050, kept for compatibility), `Reverb`, `Low Pass Filter Level 1/2`, and a
+  `Volumen del audio` submenu with 0/25/50/100/150/200%. Effect options are
+  mutually exclusive and clicking the active one clears it (`AUDIO_FX_NONE`).
+  Stored in the ini as `[Audio] Enabled`, `[Audio] Effect` (0=none, 1=reverb,
+  2=LPF1, 3=LPF2) and `[Audio] Volume` (percent).
 - `MAX_ACTIONS` is 11 (UP, DOWN, LEFT, RIGHT, A, B, Select, Start, AutoA,
   AutoB, Speedup). Adding an action requires: a row in `g_bindings`,
   `g_action_names`, `kAllCtrlIds`, and matching `IDC_KEY_*` edit boxes plus
