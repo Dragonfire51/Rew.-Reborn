@@ -71,6 +71,23 @@ int main(int argc, char** argv) {
         fclose(f);
         std::printf("borde guardado en %s\n", path);
     }
+    // Modos CGB+SGB: comprobar la captura del borde real (ejecuta la ROM en un
+    // SGB desechable sin alterar la partida CGB).
+    if (mode == SYS_GBC_SGB || mode == SYS_GBC_INIT_SGB) {
+        Bus cap;
+        cap = g_bus;
+        cap.sgbSignatureMode = 1;
+        cap.isCgbMode = false;
+        cap.reset();
+        bool capOk = false;
+        for (int i = 0; i < 600 && !capOk; ++i) { cap.runFrame(); if (cap.sgbBorderFromPacket) capOk = true; }
+        int capOpaque = 0;
+        if (capOk) {
+            cap.sgbRebuildBorderInto(g_sgb_captured_border);
+            for (int i = 0; i < SGB_W * SGB_H; ++i) if (g_sgb_captured_border[i]) capOpaque++;
+        }
+        std::printf("captura CGB+SGB: ok=%d borde opaco=%d/%d\n", capOk ? 1 : 0, capOpaque, SGB_W * SGB_H);
+    }
     { FILE* f = fopen("/tmp/raw_last.bin", "wb"); fwrite(g_raw, 1, g_raw_n, f); fclose(f); }
 
     return 0;

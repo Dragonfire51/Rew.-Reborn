@@ -1,5 +1,13 @@
 // ============================================================================
 // Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
+// v0.8.2-alpha: bordes reales en los modos CGB+SGB, nombre de ROM en el
+//   titulo y Speedup sincronizado con el audio.
+//   - Los modos "Game Boy Color + SGB Border" y "... + Initial SGB Border"
+//     muestran el borde real del juego (Pokemon Oro/Plata/Cristal, Telefang,
+//     bootlegs, etc.) conservando el color CGB.
+//   - El titulo de la ventana muestra el nombre del cartucho cargado.
+//   - El Speedup mantiene el ritmo y acelera la reproduccion de audio a la
+//     misma tasa (o lo silencia si el dispositivo no lo admite).
 // v0.8.1-alpha: modos Super Game Boy con borde y Speedup Toggle.
 //   - System: Auto, Game Boy (DMG), Super Game Boy, Game Boy + SGB Border,
 //     Game Boy Color + SGB Border y Game Boy Color + Initial SGB Border.
@@ -37,6 +45,14 @@
 #include <ctime>
 #include <algorithm>
 
+#ifndef REW_HEADLESS
+// MAX_PATH lo aporta windows.h
+#else
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+#endif
+
 const int GB_WIDTH = 160;
 const int GB_HEIGHT = 144;
 uint32_t g_screenBuffer[GB_WIDTH * GB_HEIGHT] = {0};
@@ -66,6 +82,23 @@ bool g_speedup_held = false;
 bool g_force_sgb_border = false;   // muestra borde tambien si el juego no trae uno
 int  g_sgb_theme_pref = -1;        // -1 = automatico segun el modo; >=0 = estilo fijo
 bool g_sgb_border_checked = false; // ya se aplico el borde real de la ROM actual
+// Captura del borde real para los modos CGB+SGB: se ejecuta el juego en un
+// modo DMG+SGB desechable hasta que envia su borde, y luego se restaura la
+// partida CGB con color mostrando ese borde. `g_sgb_capture_pending` queda a
+// true mientras la partida en curso aun no tiene su borde real.
+bool g_sgb_capture_pending = false;
+uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
+int  g_sgb_captured_count = 0;
+char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.8.2-alpha";
+// Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
+// modo que el sonido conserva su tono mientras la emulacion acelera. Si el
+// dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
+// speedup en lugar de perder el sincronismo.
+bool  g_speedup_rate_active = false;    // waveOut ya esta a la frecuencia M
+bool  g_speedup_audio_muted = false;    // el dispositivo no acelera: se silencia
+bool  g_speedup_rate_supported = true;
+bool  g_speedup_prev = false;           // estado de speedup en el fotograma anterior
 
 // Modos de sistema (System menu). 0 y 1 ya existian.
 enum { SYS_AUTO = 0, SYS_DMG = 1, SYS_SGB = 2, SYS_GB_SGB = 3, SYS_GBC_SGB = 4, SYS_GBC_INIT_SGB = 5 };
@@ -673,7 +706,7 @@ public:
         if (idx == 0) return 0x000000;   // color 0 = transparente (fondo)
         return sgbRgb555to888(sgbPalData[pal * 16 + idx]);
     }
-    void sgbRebuildBorder() {
+    void sgbRebuildBorderInto(uint32_t* out) {
         if (!sgbHasTiles || !sgbHasMap) return;
         for (int my = 0; my < 28; ++my)
             for (int mx = 0; mx < 32; ++mx) {
@@ -687,11 +720,20 @@ public:
                     for (int px = 0; px < 8; ++px) {
                         int dx = mx * 8 + (xf ? 7 - px : px);
                         int dy = my * 8 + (yf ? 7 - py : py);
-                        sgbDecodedBorder[dy * SGB_W + dx] = sgbTilePixel(tile, px, py, pal);
+                        out[dy * SGB_W + dx] = sgbTilePixel(tile, px, py, pal);
                     }
             }
+    }
+    void sgbRebuildBorder() {
+        if (!sgbHasTiles || !sgbHasMap) return;
+        sgbRebuildBorderInto(sgbDecodedBorder);
         sgbBorderFromPacket = true;
     }
+    // Firma SGB en el registro C tras el arranque: C=0x14 (SGB/SGB2), C=0x00
+    // (CGB), C=0x13 (DMG normal). Solo se expone cuando la peticion de modo la
+    // activa, de modo que la firma "por defecto" de cada hardware se conserva.
+    int sgbSignatureMode = 0;   // 0 = normal, 1 = forzar C=0x14
+
     // Procesa un paquete completo (16 bytes).
     void sgbHandlePacket(const uint8_t* p) {
         uint8_t cmd = p[0] >> 3;
@@ -836,9 +878,11 @@ public:
     void reset() {
         if (isCgbMode) { a = 0x11; f = 0x80; b = 0x00; c = 0x00; d = 0xFF; e = 0x56; h = 0x00; l = 0x0D; }
         else { a = 0x01; f = 0xB0; b = 0x00; c = 0x13; d = 0x00; e = 0xD8; h = 0x01; l = 0x4D; }
-        // En modos Super Game Boy, la firma de arranque es C=0x14 (SGB/SGB2);
-        // asi los juegos habilitan sus funciones SGB y envian su borde.
-        if (!isCgbMode && ModeIsSgb(g_model_pref)) c = 0x14;
+        // Firma de arranque: C=0x14 anuncia un Super Game Boy (SGB/SGB2) y hace
+        // que el juego habilite sus funciones SGB (y envie su borde). Los modos
+        // DMG+SGB la exponen siempre; los modos CGB+SGB la piden solo durante la
+        // captura del borde (la partida real conserva C=0x00 y su color CGB).
+        if (sgbSignatureMode || (!isCgbMode && ModeIsSgb(g_model_pref))) c = 0x14;
         pc = 0x100; sp = 0xFFFE;
         ime = imeEnablePending = halted = haltBugPending = false;
         divCounter = isCgbMode ? 0x1EA0 : 0xABCC;
@@ -1951,12 +1995,66 @@ void InitSgbBorder(int mode) {
         g_sgb_border_index = -1;   // marca: borde real de la ROM
         return;
     }
+    // Modos CGB+SGB: el juego CGB no envia su borde por si mismo, pero se
+    // capturo antes ejecutandolo en un modo DMG+SGB. Se usa ese borde real.
+    if (g_sgb_captured_count > 0) {
+        memcpy(g_sgbBuffer, g_sgb_captured_border, sizeof(g_sgbBuffer));
+        g_sgb_border_index = -1;
+        return;
+    }
     if (BuscarBordeSgbExterno(g_rom_base_name)) { g_sgb_border_index = -2; return; }
     if (!g_force_sgb_border) { g_sgb_border_active = false; g_sgb_border_index = 0; return; }
     int theme = (g_sgb_theme_pref >= 0) ? g_sgb_theme_pref : SgbThemeForMode(mode);
     g_sgb_border_index = theme;
     const SgbTheme& t = kSgbThemes[theme];
     GenerarBordeSgb(theme, t.base, t.accent, t.extra);
+}
+
+// ---------------------------------------------------------------------------
+// Captura del borde real para los modos CGB+SGB. Un juego CGB arranca con la
+// firma C=0x00 y no envia paquetes SGB; si se le forzara la firma C=0x14 en
+// modo CGB, muchos juegos (Pokemon Gold/Silver/Crystal) se colgarian. En su
+// lugar se ejecuta el cartucho en un modo DMG+SGB desechable, se espera a que
+// llegue su borde (CHR_TRN/PCT_TRN) y se guarda; despues se restaura la partida
+// CGB con color, que mostrara ese borde. Devuelve true si se capturo.
+// ---------------------------------------------------------------------------
+static const int kSgbCaptureFrames = 600;
+
+bool CapturarBordeSgbParaCgb() {
+    if (g_bus.rom.empty()) return false;
+
+    static Bus capBus;
+    capBus = g_bus;                       // mismo cartucho, sin tocar g_bus
+    capBus.sgbSignatureMode = 1;          // exponer la firma SGB (C=0x14)
+    capBus.isCgbMode = false;             // ejecutar como DMG (hardware SGB)
+    capBus.reset();
+
+    bool capturado = false;
+    for (int i = 0; i < kSgbCaptureFrames; ++i) {
+        capBus.runFrame();
+        if (capBus.sgbBorderFromPacket) { capturado = true; break; }
+    }
+    if (capturado) {
+        capBus.sgbRebuildBorderInto(g_sgb_captured_border);
+        g_sgb_captured_count = SGB_W * SGB_H;
+    }
+    capBus.rom.clear();                   // no conservar copia del cartucho
+    return capturado;
+}
+
+// Prepara el borde para el modo pedido. En los modos DMG+SGB el juego lo envia
+// por si mismo al arrancar; en los modos CGB+SGB se captura de antemano.
+void PrepararBordeParaModo(int mode) {
+    g_sgb_captured_count = 0;
+    g_sgb_capture_pending = false;
+    if (mode == SYS_GBC_SGB || mode == SYS_GBC_INIT_SGB) {
+        if (!g_bus.rom.empty()) {
+            if (!CapturarBordeSgbParaCgb()) g_sgb_capture_pending = true;
+        } else {
+            g_sgb_capture_pending = true;
+        }
+    }
+    InitSgbBorder(mode);
 }
 
 
@@ -2030,6 +2128,26 @@ void IniciarAudio(HWND hWnd) {
     g_waveOutReady = true;
 }
 
+// Ajusta la frecuencia de reproduccion de waveOut para que el audio siga a la
+// emulacion durante el speedup. Devuelve false si el dispositivo no admite el
+// cambio (el llamador silencia entonces el audio durante el speedup).
+bool AplicarTasaSpeedup(bool activo) {
+    if (!g_waveOutReady || !g_hWaveOut) return false;
+    if (!g_speedup_rate_supported) return false;
+    DWORD target = activo ? (DWORD)(APU::SAMPLE_RATE * SGB_SPEEDUP_MULT) : (DWORD)APU::SAMPLE_RATE;
+    DWORD cur = 0;
+    if (waveOutGetPlaybackRate(g_hWaveOut, &cur) == MMSYSERR_NOERROR && cur == target) {
+        g_speedup_rate_active = activo;
+        return true;
+    }
+    if (waveOutSetPlaybackRate(g_hWaveOut, target) == MMSYSERR_NOERROR) {
+        g_speedup_rate_active = activo;
+        return true;
+    }
+    g_speedup_rate_supported = false;
+    return false;
+}
+
 void CerrarAudio() {
     if (g_hWaveOut) {
         waveOutReset(g_hWaveOut);
@@ -2046,7 +2164,7 @@ void CerrarAudio() {
 }
 
 void EnviarFrameAudio() {
-    if (!g_waveOutReady || !g_audio_enabled) { g_bus.apu.sampleCount = 0; return; }
+    if (!g_waveOutReady || !g_audio_enabled || g_speedup_audio_muted) { g_bus.apu.sampleCount = 0; return; }
 
     int n = g_bus.apu.sampleCount;   // samples estéreo totales (L+R ya contados)
     if (n <= 0) return;
@@ -2065,6 +2183,16 @@ void EnviarFrameAudio() {
     if (!hdr) {
         g_bus.apu.sampleCount = 0;
         return;
+    }
+
+    // Durante el speedup la emulacion genera audio M veces mas rapido que la
+    // reproduccion; si aun quedan trozos por sonar, se descarta el actual para
+    // no acumular retardo (la reproduccion va a la frecuencia acelerada).
+    if (g_speedup_held && g_speedup_rate_active) {
+        int pendientes = 0;
+        for (int i = 0; i < WAVE_HDRS; ++i)
+            if (!(g_waveHdrs[i].dwFlags & WHDR_DONE)) pendientes++;
+        if (pendientes > 2) { g_bus.apu.sampleCount = 0; return; }
     }
 
     memcpy(g_waveBufs[idx], g_bus.apu.sampleBuf, n * sizeof(int16_t));
@@ -2362,14 +2490,20 @@ void ActualizarEstadoMenusArchivo(HWND hWnd) {
     DrawMenuBar(hWnd);
 }
 
+void ActualizarTituloVentana(HWND hWnd);
+
 void LiberarRomActual(HWND hWnd) {
     if (!g_rom_loaded) return;
     GuardarSramCartucho();
     g_bus.rom.clear();
     g_rom_loaded = false;
     g_emulation_paused = false;
+    g_rom_display_name[0] = '\0';
+    g_sgb_captured_count = 0;
+    g_sgb_capture_pending = false;
     for (int i = 0; i < GB_WIDTH * GB_HEIGHT; ++i) g_screenBuffer[i] = 0;
     ActualizarEstadoMenusArchivo(hWnd);
+    ActualizarTituloVentana(hWnd);
     InvalidateRect(hWnd, NULL, TRUE);
     UpdateWindow(hWnd);
     MessageBoxA(hWnd, "ROM liberada de la memoria RAM con exito.", "Rew. Reborn", MB_OK | MB_ICONINFORMATION);
@@ -2392,6 +2526,41 @@ void AlternarPausaEmulador(HWND hWnd) {
     ActualizarEstadoMenusArchivo(hWnd);
 }
 
+// Titulo de la ventana: "base - <ROM> - FPS". Se refresca al cargar la ROM y
+// tambien desde el bucle principal (contador de FPS).
+void ActualizarTituloVentana(HWND hWnd) {
+    char titulo[MAX_PATH * 2];
+    if (g_rom_display_name[0])
+        wsprintfA(titulo, "%s - %s", g_window_base_title, g_rom_display_name);
+    else
+        lstrcpyA(titulo, g_window_base_title);
+    SetWindowTextA(hWnd, titulo);
+}
+
+// Nombre del cartucho para el titulo: el titulo de la cabecera de la ROM
+// (0x134..0x143) si es legible; si no, el nombre del archivo sin extension.
+void EstablecerNombreRom(const char* szFile) {
+    const uint8_t* h = g_bus.rom.data();
+    size_t n = g_bus.rom.size();
+    char nombre[17];
+    int k = 0;
+    if (n > 0x143) {
+        for (int i = 0x134; i <= 0x143; ++i) {
+            uint8_t c = h[i];
+            if (c == 0) break;
+            nombre[k++] = (c >= 32 && c < 127) ? (char)c : ' ';
+        }
+    }
+    nombre[k] = '\0';
+    while (k > 0 && nombre[k - 1] == ' ') nombre[--k] = '\0';
+    if (k > 0) { lstrcpyA(g_rom_display_name, nombre); return; }
+    const char* base = strrchr(szFile, '\\');
+    base = base ? base + 1 : szFile;
+    lstrcpynA(g_rom_display_name, base, MAX_PATH);
+    char* dot = strrchr(g_rom_display_name, '.');
+    if (dot) *dot = '\0';
+}
+
 bool CargarRomDesdeRuta(HWND hWnd, const char* szFile) {
     if (g_rom_loaded) GuardarSramCartucho();
     if (!g_bus.loadRom(std::string(szFile))) {
@@ -2409,14 +2578,17 @@ bool CargarRomDesdeRuta(HWND hWnd, const char* szFile) {
     char* dot = strrchr(g_rom_base_name, '.');
     if (dot) *dot = '\0';
     CargarSramCartucho();
+    // Nombre del cartucho para el titulo de la ventana.
+    EstablecerNombreRom(szFile);
     // El borde real de la ROM se recibe por paquetes SGB al arrancar; hay que
     // reencuadrar la ventana cuando llegue (se detecta en el bucle principal).
     g_sgb_border_checked = false;
-    InitSgbBorder(g_model_pref);
+    PrepararBordeParaModo(g_model_pref);
     ResizeEmulatorWindow(hWnd, g_window_scale);
     memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
     g_emulation_paused = false;
     ActualizarEstadoMenusArchivo(hWnd);
+    ActualizarTituloVentana(hWnd);
     RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
     return true;
 }
@@ -2557,7 +2729,7 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v0.8.1-alpha\n"
+        "Rew. Reborn v0.8.2-alpha\n"
         "Emulador Game Boy / Game Boy Color\n\n"
         "- Modos Super Game Boy con borde (256x224):\n"
         "  Game Boy, Game Boy Color + SGB Border y\n"
@@ -2565,6 +2737,11 @@ void MostrarAcercaDe(HWND hWnd) {
         "- Bordes SGB reales: se decodifican los paquetes\n"
         "  CHR_TRN/PCT_TRN de la ROM (Pokemon Red/Gold,\n"
         "  Yellow, Telefang, etc.)\n"
+        "- Los modos Game Boy Color + SGB Border y\n"
+        "  Game Boy Color + Initial SGB Border muestran el\n"
+        "  borde real del juego conservando el color CGB\n"
+        "- El titulo de la ventana muestra el nombre del\n"
+        "  cartucho cargado\n"
         "- Force SGB Border: muestra un borde aunque el\n"
         "  juego no incluya uno (estilos tipo Pokemon)\n"
         "- Bordes externos: <rom>.sgb / <rom>.bmp 256x224\n"
@@ -2669,8 +2846,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
                                    LOWORD(wp), MF_BYCOMMAND);
                 if (pref != g_model_pref) {
                     g_model_pref = pref;
-                    InitSgbBorder(pref);
-                    ResizeEmulatorWindow(hWnd, g_window_scale);
+                    if (!g_rom_loaded) {
+                        PrepararBordeParaModo(pref);
+                        ResizeEmulatorWindow(hWnd, g_window_scale);
+                    }
                     GuardarConfiguracionIni();
                     if (g_rom_loaded) {
                         char path[MAX_PATH];
@@ -2771,7 +2950,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     RECT rc = {0, 0, (g_sgb_border_active ? SGB_W : GB_WIDTH) * g_window_scale,
                (g_sgb_border_active ? SGB_H : GB_HEIGHT) * g_window_scale};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
-    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.8.1-alpha", WS_OVERLAPPEDWINDOW,
+    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.8.2-alpha", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, hInst, NULL);
     ShowWindow(hWnd, nShow); UpdateWindow(hWnd);
 
@@ -2797,10 +2976,28 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
             DispatchMessageA(&msg);
         } else {
             if (g_rom_loaded && !g_emulation_paused) {
-                // Speedup: si la tecla esta pulsada se ejecutan varios frames
-                // sin esperar el sincronismo de tiempo real. Al soltar la tecla
-                // se corta el lote en curso para volver a la velocidad normal
-                // de inmediato.
+                // Speedup: mientras la tecla esta pulsada se ejecutan M frames
+                // por fotograma, pero el ritmo se mantiene estable (objetivo de
+                // tiempo real a M velocidad) para que el audio no pierda el
+                // sincronismo. El audio de waveOut se acelera a la misma tasa;
+                // si el dispositivo no lo admite, se silencia durante el
+                // speedup. Al soltar la tecla se corta el lote en curso.
+                if (g_speedup_held && !g_speedup_prev) {
+                    g_speedup_prev = true;
+                    g_speedup_rate_active = false;
+                    g_speedup_audio_muted = false;
+                    if (!AplicarTasaSpeedup(true)) g_speedup_audio_muted = true;
+                } else if (!g_speedup_held && g_speedup_prev) {
+                    g_speedup_prev = false;
+                    if (!g_speedup_audio_muted) AplicarTasaSpeedup(false);
+                    g_speedup_audio_muted = false;
+                    g_speedup_rate_active = false;
+                    g_bus.apu.sampleCount = 0;
+                    QueryPerformanceCounter(&lastFrameTime);
+                }
+                LONGLONG ticksPerEmuFrame = g_speedup_held
+                    ? (LONGLONG)(qpcFreq.QuadPart * 70224 / (4194304.0 * SGB_SPEEDUP_MULT))
+                    : ticksPerFrame;
                 int framesThisTick = g_speedup_held ? SGB_SPEEDUP_MULT : 1;
                 int framesRun = 0;
                 for (int f = 0; f < framesThisTick; ++f) {
@@ -2821,21 +3018,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                     InitSgbBorder(g_model_pref);
                     ResizeEmulatorWindow(hWnd, g_window_scale);
                 }
+                // Modos CGB+SGB: si al cargar la ROM todavia no habia cartucho (o
+                // la captura fallo), se intenta capturar el borde real ahora.
+                if (g_sgb_capture_pending && g_rom_loaded && !g_bus.rom.empty()) {
+                    g_sgb_capture_pending = false;
+                    if (CapturarBordeSgbParaCgb()) {
+                        InitSgbBorder(g_model_pref);
+                        ResizeEmulatorWindow(hWnd, g_window_scale);
+                    }
+                }
                 EnviarFrameAudio();				
                 InvalidateRect(hWnd, NULL, FALSE);
                 UpdateWindow(hWnd);
 
                 LARGE_INTEGER now;
                 QueryPerformanceCounter(&now);
-                if (!g_speedup_held) {
-                    LONGLONG elapsed = now.QuadPart - lastFrameTime.QuadPart;
-                    if (elapsed < ticksPerFrame) {
-                        LONGLONG remaining = ticksPerFrame - elapsed;
-                        DWORD sleepMs = (DWORD)(remaining / (qpcFreq.QuadPart / 1000));
-                        if (sleepMs > 3) Sleep(sleepMs - 2);
-                        do { QueryPerformanceCounter(&now); }
-                        while ((now.QuadPart - lastFrameTime.QuadPart) < ticksPerFrame);
-                    }
+                // Ritmo estable: se espera a que transcurra el tiempo de los
+                // frames ejecutados a la velocidad actual (normal o M).
+                LONGLONG objetivo = lastFrameTime.QuadPart + ticksPerEmuFrame * framesRun;
+                if (now.QuadPart < objetivo) {
+                    LONGLONG restante = objetivo - now.QuadPart;
+                    DWORD sleepMs = (DWORD)(restante / (qpcFreq.QuadPart / 1000));
+                    if (sleepMs > 2) Sleep(sleepMs - 1);
+                    do { QueryPerformanceCounter(&now); } while (now.QuadPart < objetivo);
                 }
                 // ★ Contador de FPS (actualiza cada 1 segundo)
                 fpsFrameCount += framesRun;
@@ -2845,10 +3050,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                 if (elapsedSec >= 1.0) {
                     double fps = fpsFrameCount / elapsedSec;
                     int fps10 = (int)(fps * 10);  // un decimal
-                    char dbg[80];
-                    wsprintfA(dbg, "Rew. Reborn v0.8.1-alpha - %d.%d FPS%s", fps10 / 10, fps10 % 10,
-                              g_speedup_held ? " [Speedup]" : "");
-                    SetWindowTextA(hWnd, dbg);
+                    char titulo[MAX_PATH * 2];
+                    if (g_rom_display_name[0])
+                        wsprintfA(titulo, "%s - %s - %d.%d FPS%s", g_window_base_title,
+                                  g_rom_display_name, fps10 / 10, fps10 % 10,
+                                  g_speedup_held ? " [Speedup]" : "");
+                    else
+                        wsprintfA(titulo, "%s - %d.%d FPS%s", g_window_base_title,
+                                  fps10 / 10, fps10 % 10, g_speedup_held ? " [Speedup]" : "");
+                    SetWindowTextA(hWnd, titulo);
                     fpsFrameCount = 0;
                     QueryPerformanceCounter(&fpsTimerStart);
                 }				

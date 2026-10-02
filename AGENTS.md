@@ -59,7 +59,7 @@ Compiling just the source (`-c`) is a fast syntax check.
 - The Key Setting dialog captures Tab as a binding (no focus navigation) so
   Speedup can be mapped to Tab.
 
-## SGB borders (v0.8.1)
+## SGB borders (v0.8.1/v0.8.2)
 - Real borders are decoded from the ROM: games send `CHR_TRN` ($13) and
   `PCT_TRN` ($14) packets over JOYP (`FF00`), and the emulator renders the
   result. `Bus::sgbWriteP1` receives the ICD2 bit protocol (start pulse =
@@ -77,14 +77,37 @@ Compiling just the source (`-c`) is a fast syntax check.
 - SGB detection: in SGB modes (`ModeIsSgb`) `reset()` sets `C=0x14` so games
   enable SGB features; `MLT_REQ` ($11) enables multiplayer and `readJoyp`
   returns the joypad ID (`$xE` = player 2, etc.) when both P14/P15 are high.
+- CGB+SGB modes (`SYS_GBC_SGB`, `SYS_GBC_INIT_SGB`) run the game in **CGB mode**
+  (`C=0x00`, full color) and do **not** let the game send its own border. Instead
+  `CapturarBordeSgbParaCgb()` runs a throwaway copy of the cart as **DMG+SGB**
+  (local `Bus`, `sgbSignatureMode=1`, up to `kSgbCaptureFrames`=600 frames until
+  `sgbBorderFromPacket`), decodes the border into `g_sgb_captured_border`, and
+  discards the copy. The real CGB session then displays that captured border.
+  Forcing `C=0x14` in CGB mode is **not** viable: Gold/Silver/Crystal hang.
+  This is triggered by `PrepararBordeParaModo()` on ROM load / mode switch.
 - Border priority in `InitSgbBorder`: real ROM border (`sgbBorderFromPacket`)
-  > external file > fallback style (only when `Force SGB Border` is on).
+  > captured border (`g_sgb_captured_border`) > external file > fallback style
+  (only when `Force SGB Border` is on).
 - `Force SGB Border` (`[System] ForceSgbBorder`) draws a themed border even for
   games that ship none; `Border Style` (`[System] BorderStyle`, -1 = auto)
   selects a `kSgbThemes` style (Pokemon Yellow/Gold/Silver/Red/Blue, Zelda...).
 - External borders: `.<rom>.sgb`, `.\borders\<rom>.sgb` / `.bmp` or
   `.\border.sgb` / `.bmp`. `.sgb` = header "SGBR" + u32 w, u32 h, w*h u32 RGB.
 - Save-state version is 9 (`kStateVersion`); SGB decoder state is serialized.
+
+## Window title
+- `g_window_base_title` is the base ("Rew. Reborn v0.8.2-alpha"); the loaded
+  cartridge is shown as `"<base> - <ROM> - <FPS>"`. The ROM name comes from the
+  header title (`0x134..0x143`, `EstablecerNombreRom`) or the filename.
+- The title is refreshed both on ROM load/free (`ActualizarTituloVentana`) and
+  once a second from the main-loop FPS counter.
+
+## Speedup audio sync
+- Speedup runs `SGB_SPEEDUP_MULT` frames per tick but keeps a stable real-time
+  pace (`ticksPerEmuFrame`) so audio does not drift. `waveOutSetPlaybackRate`
+  raises the device rate to `M x 44100` while held; if unsupported,
+  `g_speedup_audio_muted` silences audio for the duration instead of
+  desynchronising. `EnviarFrameAudio` drops queued chunks (`>2`) during speedup.
 
 ## C++ style notes
 - Spanish user-facing strings.
