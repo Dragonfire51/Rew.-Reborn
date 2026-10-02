@@ -2020,6 +2020,89 @@ uint32_t MultiplicadorTasaAudio(uint32_t hz, uint32_t hzBase) {
     return (uint32_t)(((uint64_t)hz << 16) / hzBase);
 }
 
+// ---------------------------------------------------------------------------
+// Efectos de audio (submenu Audio). Se aplican a las muestras ya mezcladas
+// justo antes de enviarlas a waveOut, asi que no alteran la emulacion: solo el
+// sonido que sale por el altavoz. Los modos de efecto son excluyentes entre si
+// (reverb O filtro paso bajo), y el volumen se aplica siempre.
+// ---------------------------------------------------------------------------
+enum {
+    AUDIO_FX_NONE   = 0,
+    AUDIO_FX_REVERB = 1,
+    AUDIO_FX_LPF1   = 2,   // filtro paso bajo suave
+    AUDIO_FX_LPF2   = 3    // filtro paso bajo mas agresivo
+};
+
+// Niveles de volumen del submenu Audio (porcentaje de la senal original).
+const int kVolumeOptions[6] = {0, 25, 50, 100, 150, 200};
+const int kVolumeCount = 6;
+
+int VolumenIndice(int percent) {
+    for (int i = 0; i < kVolumeCount; ++i)
+        if (kVolumeOptions[i] == percent) return i;
+    return 3;   // 100% por defecto
+}
+
+struct AudioFx {
+    int mode = AUDIO_FX_NONE;
+    int volume = 100;                       // porcentaje
+
+    // Reverb: dos lineas de retardo (una por canal) con realimentacion.
+    static constexpr int REV_LEN = 2048;
+    int16_t revL[REV_LEN] = {0};
+    int16_t revR[REV_LEN] = {0};
+    int revPos = 0;
+    // Filtro paso bajo de un polo (y += a*(x-y)); a mas pequeno, mas suave.
+    double lpL = 0.0, lpR = 0.0;
+
+    void reset() {
+        mode = AUDIO_FX_NONE;
+        volume = 100;
+        memset(revL, 0, sizeof(revL));
+        memset(revR, 0, sizeof(revR));
+        revPos = 0;
+        lpL = lpR = 0.0;
+    }
+
+    static int16_t clipd(double v) {
+        if (v > 32767.0) return 32767;
+        if (v < -32768.0) return -32768;
+        return (int16_t)v;
+    }
+
+    // n = numero de int16 en buf (L+R intercalados).
+    void process(int16_t* buf, int n) {
+        if (mode == AUDIO_FX_NONE && volume == 100) return;
+
+        const double gain = volume / 100.0;
+        const double a = (mode == AUDIO_FX_LPF2) ? 0.20 : (mode == AUDIO_FX_LPF1 ? 0.45 : 1.0);
+
+        for (int i = 0; i + 1 < n; i += 2) {
+            double l = buf[i];
+            double r = buf[i + 1];
+
+            if (mode == AUDIO_FX_REVERB) {
+                const int idx = revPos;
+                const double dl = revL[idx];
+                const double dr = revR[idx];
+                revL[idx] = clipd(l * 0.5 + dl * 0.55);
+                revR[idx] = clipd(r * 0.5 + dr * 0.55);
+                revPos = (revPos + 1) % REV_LEN;
+                l += dl * 0.30;   // mezcla del eco (wet)
+                r += dr * 0.30;
+            } else if (mode == AUDIO_FX_LPF1 || mode == AUDIO_FX_LPF2) {
+                lpL += a * (l - lpL);
+                lpR += a * (r - lpR);
+                l = lpL;
+                r = lpR;
+            }
+
+            buf[i]     = clipd(l * gain);
+            buf[i + 1] = clipd(r * gain);
+        }
+    }
+};
+
 #ifndef REW_HEADLESS
 int g_active_slot = 0;
 bool g_emulation_paused = false;
@@ -2028,6 +2111,17 @@ char g_rom_full_path[MAX_PATH] = "";
 int  g_window_scale = 2;
 
 bool g_audio_enabled = true;
+
+// Estado del submenu Audio (efecto + volumen) y su filtro de salida.
+AudioFx g_audio_fx;
+int g_audio_effect = AUDIO_FX_NONE;   // reverb / LPF1 / LPF2
+int g_audio_volume = 100;             // 0, 25, 50, 100, 150 o 200
+
+// Vuelca el estado del menu al filtro de salida. Se llama al cambiar de opcion.
+void AplicarEfectosAudio() {
+    g_audio_fx.mode = g_audio_effect;
+    g_audio_fx.volume = g_audio_volume;
+}
 
 // ---------------------------------------------------------------------------
 // Carga de bordes externos. Formato propio ".sgb" (cabecera "SGBR"):
@@ -2192,6 +2286,14 @@ WNDPROC g_origEditProc[MAX_ACTIONS][4] = { nullptr };
 #define ID_SGB_THEME_AUTO 40052
 #define ID_SGB_THEME_BASE 40060   // + indice de estilo (SGB_THEME_COUNT)
 
+// Submenu Audio: Sonido, efectos y volumen (creados en tiempo de ejecucion).
+#define ID_AUDIO_ON       40080
+#define ID_AUDIO_OFF      40081
+#define ID_AUDIO_REVERB   40082
+#define ID_AUDIO_LPF1     40083
+#define ID_AUDIO_LPF2     40084
+#define ID_AUDIO_VOL_BASE 40090   // + indice de volumen (kVolumeOptions)
+
 void ActualizarMenuDeEstados(HWND hWnd);
 
 // ============================================================================
@@ -2303,6 +2405,7 @@ void EnviarFrameAudio() {
     }
 
     memcpy(g_waveBufs[idx], g_bus.apu.sampleBuf, n * sizeof(int16_t));
+    g_audio_fx.process(g_waveBufs[idx], n);
 
     hdr->dwBufferLength = n * sizeof(int16_t);
     hdr->dwFlags = WHDR_PREPARED;
@@ -2339,6 +2442,10 @@ void GuardarConfiguracionIni() {
     WritePrivateProfileStringA("Video", "Scale", szVal, szPath);
     wsprintfA(szVal, "%d", g_audio_enabled ? 1 : 0);
     WritePrivateProfileStringA("Audio", "Enabled", szVal, szPath);
+    wsprintfA(szVal, "%d", g_audio_effect);
+    WritePrivateProfileStringA("Audio", "Effect", szVal, szPath);
+    wsprintfA(szVal, "%d", g_audio_volume);
+    WritePrivateProfileStringA("Audio", "Volume", szVal, szPath);
     wsprintfA(szVal, "%d", g_model_pref);
     WritePrivateProfileStringA("System", "Model", szVal, szPath);
     wsprintfA(szVal, "%d", g_force_sgb_border ? 1 : 0);
@@ -2359,6 +2466,11 @@ void CargarConfiguracionIni() {
     if (g_window_scale < 1) g_window_scale = 1;
     if (g_window_scale > 4) g_window_scale = 4;
     g_audio_enabled = GetPrivateProfileIntA("Audio", "Enabled", 1, szPath) != 0;
+    g_audio_effect = GetPrivateProfileIntA("Audio", "Effect", AUDIO_FX_NONE, szPath);
+    if (g_audio_effect < AUDIO_FX_NONE || g_audio_effect > AUDIO_FX_LPF2) g_audio_effect = AUDIO_FX_NONE;
+    g_audio_volume = GetPrivateProfileIntA("Audio", "Volume", 100, szPath);
+    g_audio_volume = kVolumeOptions[VolumenIndice(g_audio_volume)];
+    AplicarEfectosAudio();
     g_model_pref = GetPrivateProfileIntA("System", "Model", 0, szPath);
     if (g_model_pref < 0 || g_model_pref >= SYSTEM_MODE_COUNT) g_model_pref = SYS_AUTO;
     g_force_sgb_border = GetPrivateProfileIntA("System", "ForceSgbBorder", 0, szPath) != 0;
@@ -2377,7 +2489,22 @@ void CrearMenusExtra(HWND hWnd) {
         AppendMenuA(hSystem, MF_STRING, ID_SYSTEM_AUTO + m, g_system_mode_names[m]);
     AppendMenuA(hOption, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hSystem, "&System");
-    AppendMenuA(hOption, MF_STRING, ID_AUDIO_TOGGLE, "&Audio");
+    HMENU hAudio = CreatePopupMenu();
+    AppendMenuA(hAudio, MF_STRING, ID_AUDIO_ON, "Sonido On");
+    AppendMenuA(hAudio, MF_STRING, ID_AUDIO_OFF, "Sonido Off");
+    AppendMenuA(hAudio, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hAudio, MF_STRING, ID_AUDIO_REVERB, "Reverb");
+    AppendMenuA(hAudio, MF_STRING, ID_AUDIO_LPF1, "Low Pass Filter Level 1");
+    AppendMenuA(hAudio, MF_STRING, ID_AUDIO_LPF2, "Low Pass Filter Level 2");
+    AppendMenuA(hAudio, MF_SEPARATOR, 0, NULL);
+    HMENU hVol = CreatePopupMenu();
+    for (int v = 0; v < kVolumeCount; ++v) {
+        char szLabel[32];
+        wsprintfA(szLabel, "%d%%", kVolumeOptions[v]);
+        AppendMenuA(hVol, MF_STRING, ID_AUDIO_VOL_BASE + v, szLabel);
+    }
+    AppendMenuA(hAudio, MF_POPUP, (UINT_PTR)hVol, "Volumen del audio");
+    AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hAudio, "&Audio");
     AppendMenuA(hOption, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hOption, MF_STRING, ID_SGB_FORCE, "Force SGB &Border");
     HMENU hTheme = CreatePopupMenu();
@@ -2388,7 +2515,12 @@ void CrearMenusExtra(HWND hWnd) {
     AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hTheme, "Border &Style");
     CheckMenuRadioItem(hMenu, ID_SYSTEM_AUTO, ID_SYSTEM_AUTO + SYSTEM_MODE_COUNT - 1,
                        ID_SYSTEM_AUTO + g_model_pref, MF_BYCOMMAND);
-    CheckMenuItem(hMenu, ID_AUDIO_TOGGLE, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(hMenu, ID_AUDIO_ON, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(hMenu, ID_AUDIO_OFF, g_audio_enabled ? MF_UNCHECKED : MF_CHECKED);
+    if (g_audio_effect != AUDIO_FX_NONE)
+        CheckMenuRadioItem(hMenu, ID_AUDIO_REVERB, ID_AUDIO_LPF2, ID_AUDIO_REVERB + (g_audio_effect - 1), MF_BYCOMMAND);
+    CheckMenuRadioItem(hMenu, ID_AUDIO_VOL_BASE, ID_AUDIO_VOL_BASE + kVolumeCount - 1,
+                       ID_AUDIO_VOL_BASE + VolumenIndice(g_audio_volume), MF_BYCOMMAND);
     CheckMenuItem(hMenu, ID_SGB_FORCE, g_force_sgb_border ? MF_CHECKED : MF_UNCHECKED);
     if (g_sgb_theme_pref < 0)
         CheckMenuRadioItem(hMenu, ID_SGB_THEME_AUTO, ID_SGB_THEME_BASE + SGB_THEME_COUNT - 1,
@@ -2841,7 +2973,10 @@ void MostrarAcercaDe(HWND hWnd) {
         "- Tomb Raider: corregidos glitches gr\341ficos y de audio\n"
         "- Pokemon Crystal: corregida la banca WRAM\n"
         "- Nuevas funciones Extra\n"
-        "- Correcci\xF3n de varios bugs\n\n"
+        "- Correcci\xF3n de varios bugs\n"
+        "- Submenu Audio: Sonido On/Off, Reverb, Low Pass\n"
+        "  Filter Level 1/2 y volumen 0%/25%/50%/100%/\n"
+        "  150%/200%\n\n"
         "- Modos Super Game Boy con borde (256x224):\n"
         "  Game Boy, Game Boy Color + SGB Border y\n"
         "  Game Boy Color + Initial SGB Border\n"
@@ -2948,6 +3083,37 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_audio_enabled = !g_audio_enabled;
                 CheckMenuItem(hM, ID_AUDIO_TOGGLE, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
                 if (!g_audio_enabled && g_hWaveOut) waveOutReset(g_hWaveOut);
+                GuardarConfiguracionIni();
+            }
+            if (LOWORD(wp) == ID_AUDIO_ON || LOWORD(wp) == ID_AUDIO_OFF) {
+                g_audio_enabled = (LOWORD(wp) == ID_AUDIO_ON);
+                CheckMenuItem(hM, ID_AUDIO_ON, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
+                CheckMenuItem(hM, ID_AUDIO_OFF, g_audio_enabled ? MF_UNCHECKED : MF_CHECKED);
+                if (!g_audio_enabled && g_hWaveOut) waveOutReset(g_hWaveOut);
+                GuardarConfiguracionIni();
+            }
+            if (LOWORD(wp) >= ID_AUDIO_REVERB && LOWORD(wp) <= ID_AUDIO_LPF2) {
+                int nuevo = LOWORD(wp) - ID_AUDIO_REVERB + 1;   // 1..3
+                g_audio_effect = (g_audio_effect == nuevo) ? AUDIO_FX_NONE : nuevo;
+                if (g_audio_effect == AUDIO_FX_NONE) {
+                    for (UINT id = ID_AUDIO_REVERB; id <= ID_AUDIO_LPF2; ++id)
+                        CheckMenuItem(hM, id, MF_UNCHECKED);
+                } else {
+                    CheckMenuRadioItem(hM, ID_AUDIO_REVERB, ID_AUDIO_LPF2,
+                                       ID_AUDIO_REVERB + (g_audio_effect - 1), MF_BYCOMMAND);
+                }
+                g_audio_fx.revPos = 0;
+                memset(g_audio_fx.revL, 0, sizeof(g_audio_fx.revL));
+                memset(g_audio_fx.revR, 0, sizeof(g_audio_fx.revR));
+                g_audio_fx.lpL = g_audio_fx.lpR = 0.0;
+                AplicarEfectosAudio();
+                GuardarConfiguracionIni();
+            }
+            if (LOWORD(wp) >= ID_AUDIO_VOL_BASE && LOWORD(wp) < ID_AUDIO_VOL_BASE + kVolumeCount) {
+                g_audio_volume = kVolumeOptions[LOWORD(wp) - ID_AUDIO_VOL_BASE];
+                CheckMenuRadioItem(hM, ID_AUDIO_VOL_BASE, ID_AUDIO_VOL_BASE + kVolumeCount - 1,
+                                   LOWORD(wp), MF_BYCOMMAND);
+                AplicarEfectosAudio();
                 GuardarConfiguracionIni();
             }
             if (LOWORD(wp) >= ID_SYSTEM_AUTO &&
