@@ -63,6 +63,9 @@ uint32_t g_sgbBuffer[SGB_W * SGB_H] = {0};
 bool g_sgb_border_active = false;
 int g_sgb_border_index = 0;
 bool g_speedup_held = false;
+bool g_force_sgb_border = false;   // muestra borde tambien si el juego no trae uno
+int  g_sgb_theme_pref = -1;        // -1 = automatico segun el modo; >=0 = estilo fijo
+bool g_sgb_border_checked = false; // ya se aplico el borde real de la ROM actual
 
 // Modos de sistema (System menu). 0 y 1 ya existian.
 enum { SYS_AUTO = 0, SYS_DMG = 1, SYS_SGB = 2, SYS_GB_SGB = 3, SYS_GBC_SGB = 4, SYS_GBC_INIT_SGB = 5 };
@@ -75,6 +78,26 @@ const char* g_system_mode_names[SYSTEM_MODE_COUNT] = {
     "Game Boy + SGB Border",
     "Game Boy Color + SGB Border",
     "Game Boy Color + Initial SGB Border"
+};
+
+// ---------------------------------------------------------------------------
+// Bordes tematicos de reserva (fallback). El borde autentico lo envia la ROM
+// por CHR_TRN/PCT_TRN; si el juego no incluye uno, se usa el estilo del modo.
+// Los temas conmutables reproducen los bordes vistos en la galeria de
+// vgmuseum (Pokemon Yellow, Gold/Silver, etc.).
+// ---------------------------------------------------------------------------
+#define SGB_THEME_COUNT 8
+
+struct SgbTheme { const char* name; uint32_t base, accent, extra; };
+static const SgbTheme kSgbThemes[SGB_THEME_COUNT] = {
+    { "Por defecto",   0x505860, 0xC8D0D8, 0x303840 },
+    { "Game Boy",      0x186028, 0x88C860, 0x0C3818 },
+    { "Pokemon Yellow",0xE8C020, 0x804000, 0xF8F0A0 },
+    { "Pokemon Gold",  0xD8A020, 0x704810, 0xF8E8B0 },
+    { "Pokemon Silver",0xB8C0C8, 0x505870, 0xE8F0F8 },
+    { "Pokemon Red",   0xC02820, 0x601010, 0xF0C0B0 },
+    { "Pokemon Blue",  0x2848A0, 0x101860, 0xB0C8F0 },
+    { "Zelda",         0x287038, 0xE8D060, 0x104020 }
 };
 
 // Paletas (base, acento) por modo. En los modos SGB se usan 8 estilos.
@@ -90,21 +113,22 @@ bool ModeIsSgb(int mode) { return mode == SYS_SGB || mode == SYS_GB_SGB; }
 // El modo CGB se decide por la ROM; Initial SGB Border fuerza GBC.
 bool ModeForcesCgb(int mode) { return mode == SYS_GBC_SGB || mode == SYS_GBC_INIT_SGB; }
 
-void GenerarBordeSgb(int index, uint32_t base, uint32_t accent);
+void GenerarBordeSgb(int index, uint32_t base, uint32_t accent, uint32_t extra = 0);
 
-void InitSgbBorder(int mode) {
-    g_sgb_border_active = ModeUsesBorder(mode);
-    if (!g_sgb_border_active) return;
-    // Estilo de borde derivado del modo, para que cada opcion se vea distinta.
-    g_sgb_border_index = (mode * 3) % SGB_BORDER_COUNT;
-    GenerarBordeSgb(g_sgb_border_index, kSgbBase[mode], kSgbAccent[mode]);
+// Estilo de reserva asociado al modo de sistema.
+int SgbThemeForMode(int mode) {
+    switch (mode) {
+        case SYS_GB_SGB:       return 1;   // Game Boy
+        case SYS_GBC_SGB:      return 2;   // Pokemon Yellow
+        case SYS_GBC_INIT_SGB: return 3;   // Pokemon Gold
+        default:               return 0;
+    }
 }
-
-// Genera el borde 256x224 de forma procedural. `index` varia el patron.
-void GenerarBordeSgb(int index, uint32_t base, uint32_t accent) {
+void GenerarBordeSgb(int index, uint32_t base, uint32_t accent, uint32_t extra) {
     auto ch = [](uint32_t c, int sh) { return (uint8_t)((c >> sh) & 0xFF); };
     int br = ch(base, 16), bg = ch(base, 8), bb = ch(base, 0);
     int ar = ch(accent, 16), ag = ch(accent, 8), ab = ch(accent, 0);
+    int xr = extra ? ch(extra, 16) : br, xg = extra ? ch(extra, 8) : bg, xb = extra ? ch(extra, 0) : bb;
     auto mix = [](int a, int b, int t) { return (a * (255 - t) + b * t) / 255; };
     auto dark = [&](int v) { return v * 55 / 100; };
     int dbr = dark(br), dbg = dark(bg), dbb = dark(bb);
@@ -120,6 +144,8 @@ void GenerarBordeSgb(int index, uint32_t base, uint32_t accent) {
             if ((x % 16) == 0 || (x % 16) == 15 || (y % 16) == 0 || (y % 16) == 15) {
                 r = dbr; g = dbg; b = dbb;
             }
+            // Motivo diagonal suave (da caracter al estilo).
+            if (((x + y) % 24) == 0) { r = mix(r, xr, 70); g = mix(g, xg, 70); b = mix(b, xb, 70); }
             // Marco exterior de 2 px.
             if (x < 2 || y < 2 || x >= SGB_W - 2 || y >= SGB_H - 2) { r = ar; g = ag; b = ab; }
             g_sgbBuffer[y * SGB_W + x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
@@ -554,7 +580,7 @@ constexpr uint8_t APU::kDuty[4][8];
 class Bus {
 public:
     static constexpr uint32_t kStateMagic = 0x52455742; // "REWB"
-    static constexpr uint32_t kStateVersion = 8;
+    static constexpr uint32_t kStateVersion = 9;
 
     // ------------------------------------------------------------ cartucho
     std::vector<uint8_t> rom;
@@ -611,6 +637,113 @@ public:
     // ------------------------------------------------------------ joypad
     uint8_t joypSelect = 0x30, buttonsState = 0xFF;
     static constexpr uint8_t kButtonBit[8] = { 2, 3, 1, 0, 4, 5, 6, 7 };
+
+    // ------------------------------------------------------------ SGB (ICD2)
+    // El SGB recibe "command packets" por los bits 4/5 de JOYP (P1). Cada
+    // pulso empieza con P14=P15=0 y a continuacion cada bit se envia bajando
+    // P14 (bit=0) o P15 (bit=1). Los paquetes CHR_TRN ($13) y PCT_TRN ($14)
+    // definen el borde 256x224 (tiles 4bpp + tilemap + 3 paletas de 15 colores).
+    uint8_t sgbP1Prev = 0x30;
+    int sgbPhase = 0;            // 0=espera, 1=recibiendo 16 bytes, 2=fin de paquete
+    int sgbByteIndex = 0, sgbBitCount = 0;
+    uint8_t sgbBitBuf = 0, sgbPacket[16] = {0};
+    bool sgbMultiPlayer = false; // MLT_REQ activo (modo multijugador)
+    int sgbPlayerCount = 2, sgbPlayerIndex = 0;
+    std::array<uint8_t, 0x2000> sgbTileData{};  // 256 tiles x 32 bytes
+    std::array<uint8_t, 0x800> sgbMapData{};    // tilemap 32x28 + fila extra
+    std::array<uint16_t, 48> sgbPalData{};      // paletas 4-6, RGB555
+    bool sgbHasTiles = false, sgbHasMap = false;
+    // Borde decodificado (256x224, RGB888).
+    uint32_t sgbDecodedBorder[SGB_W * SGB_H] = {0};
+    bool sgbBorderFromPacket = false;
+
+    static uint32_t sgbRgb555to888(uint16_t c) {
+        int r = (c & 0x1F) << 3, g = ((c >> 5) & 0x1F) << 3, b = ((c >> 10) & 0x1F) << 3;
+        return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+    // Pixel 4bpp: dos "Game Boy tiles" intercalados (bits 0-1 y bits 2-3).
+    // El indice de color 0 de cada paleta es transparente (muestra el fondo).
+    uint32_t sgbTilePixel(int tile, int px, int py, int pal) const {
+        int off = tile * 32 + py * 2;
+        uint8_t lo = sgbTileData[off] >> (7 - px);
+        uint8_t hi = sgbTileData[off + 1] >> (7 - px);
+        uint8_t l2 = sgbTileData[off + 16] >> (7 - px);
+        uint8_t h2 = sgbTileData[off + 17] >> (7 - px);
+        int idx = (lo & 1) | ((hi & 1) << 1) | ((l2 & 1) << 2) | ((h2 & 1) << 3);
+        if (idx == 0) return 0x000000;   // color 0 = transparente (fondo)
+        return sgbRgb555to888(sgbPalData[pal * 16 + idx]);
+    }
+    void sgbRebuildBorder() {
+        if (!sgbHasTiles || !sgbHasMap) return;
+        for (int my = 0; my < 28; ++my)
+            for (int mx = 0; mx < 32; ++mx) {
+                uint16_t e = (uint16_t)(sgbMapData[(my * 32 + mx) * 2] |
+                                        (sgbMapData[(my * 32 + mx) * 2 + 1] << 8));
+                int tile = e & 0x3FF;
+                int pal = (e >> 10) & 7;
+                if (pal < 4 || pal > 6) continue;   // solo paletas de borde
+                bool xf = (e & 0x4000) != 0, yf = (e & 0x8000) != 0;
+                for (int py = 0; py < 8; ++py)
+                    for (int px = 0; px < 8; ++px) {
+                        int dx = mx * 8 + (xf ? 7 - px : px);
+                        int dy = my * 8 + (yf ? 7 - py : py);
+                        sgbDecodedBorder[dy * SGB_W + dx] = sgbTilePixel(tile, px, py, pal - 4);
+                    }
+            }
+        sgbBorderFromPacket = true;
+    }
+    // Procesa un paquete completo (16 bytes).
+    void sgbHandlePacket(const uint8_t* p) {
+        uint8_t cmd = p[0] >> 3;
+        switch (cmd) {
+            case 0x11: { // MLT_REQ: activa multijugador para deteccion por P1
+                int ctrl = p[1] & 3;
+                sgbMultiPlayer = (ctrl & 1) != 0;
+                sgbPlayerCount = (ctrl & 2) ? 4 : 2;
+                sgbPlayerIndex = 0;
+                joypSelect = (joypSelect & 0xCF) | 0x10;
+                return;
+            }
+            case 0x13: { // CHR_TRN: 128 tiles (4 KiB) desde VRAM
+                int base = (p[1] & 1) ? 128 * 32 : 0;
+                for (int i = 0; i < 128 * 32; ++i) sgbTileData[base + i] = vram[i];
+                sgbHasTiles = true;
+                break;
+            }
+            case 0x14: { // PCT_TRN: tilemap (0x700) + paletas (0x60 bytes) desde VRAM
+                for (int i = 0; i < 0x700; ++i) sgbMapData[i] = vram[i];
+                for (int i = 0; i < 48; ++i)   // 3 paletas x 16 colores RGB555
+                    sgbPalData[i] = (uint16_t)(vram[0x800 + i * 2] | (vram[0x800 + i * 2 + 1] << 8));
+                sgbHasMap = true;
+                break;
+            }
+            default: break;
+        }
+        sgbRebuildBorder();
+    }
+    // Alimenta P1 tras escribir en FF00 (protocolo ICD2 del SGB).
+    void sgbWriteP1(uint8_t value) {
+        uint8_t v = value & 0x30;
+        bool startPulse = (v == 0x00) && (sgbP1Prev != 0x00);
+        // Un pulso de bit es cualquier bajada a 0x10/0x20 desde una fase de
+        // reposo (0x00 tras el start, o 0x30), nunca desde otro pulso.
+        bool fromIdle = (sgbP1Prev == 0x00 || sgbP1Prev == 0x30);
+        bool bitLow  = (v == 0x10) && fromIdle;  // bit = 0
+        bool bitHigh = (v == 0x20) && fromIdle;  // bit = 1
+        sgbP1Prev = v;
+        if (startPulse) {
+            sgbPhase = 1; sgbByteIndex = 0; sgbBitCount = 0; sgbBitBuf = 0;
+            return;
+        }
+        if (sgbPhase != 1 || (!bitLow && !bitHigh)) return;
+        if (bitHigh) sgbBitBuf |= (uint8_t)(1u << sgbBitCount);
+        if (++sgbBitCount == 8) {
+            if (sgbByteIndex < 16) sgbPacket[sgbByteIndex] = sgbBitBuf;
+            sgbByteIndex++;
+            sgbBitCount = 0; sgbBitBuf = 0;
+            if (sgbByteIndex == 16) { sgbPhase = 2; sgbHandlePacket(sgbPacket); }
+        }
+    }
 
     // ------------------------------------------------------------ PPU
     uint8_t lcdc = 0x91, stat = 0x80, scy = 0, scx = 0, ly = 0, lyReg = 0, lyc = 0;
@@ -696,6 +829,9 @@ public:
     void reset() {
         if (isCgbMode) { a = 0x11; f = 0x80; b = 0x00; c = 0x00; d = 0xFF; e = 0x56; h = 0x00; l = 0x0D; }
         else { a = 0x01; f = 0xB0; b = 0x00; c = 0x13; d = 0x00; e = 0xD8; h = 0x01; l = 0x4D; }
+        // En modos Super Game Boy, la firma de arranque es C=0x14 (SGB/SGB2);
+        // asi los juegos habilitan sus funciones SGB y envian su borde.
+        if (!isCgbMode && ModeIsSgb(g_model_pref)) c = 0x14;
         pc = 0x100; sp = 0xFFFE;
         ime = imeEnablePending = halted = haltBugPending = false;
         divCounter = isCgbMode ? 0x1EA0 : 0xABCC;
@@ -704,6 +840,11 @@ public:
         rtcLatchPrev = 0xFF; rtcSubDots = 0;
         dmaActive = false; dmaIndex = 0; dmaReg = 0xFF; dmaSrc = 0; dmaPendingSrc = 0; dmaStartDelay = 0;
         joypSelect = 0x30; buttonsState = 0xFF;
+        sgbP1Prev = 0x30; sgbPhase = 0; sgbByteIndex = 0; sgbBitCount = 0; sgbBitBuf = 0;
+        sgbMultiPlayer = false; sgbPlayerCount = 2; sgbPlayerIndex = 0;
+        sgbHasTiles = sgbHasMap = false; sgbBorderFromPacket = false;
+        sgbTileData.fill(0); sgbMapData.fill(0); sgbPalData.fill(0);
+        memset(sgbDecodedBorder, 0, sizeof(sgbDecodedBorder));
         sb = 0; sc = 0x7E; serialCycles = 0; serialOut.clear();
         vram.fill(0); vram1.fill(0); wram.fill(0); oam.fill(0); hram.fill(0);
         ie = 0; iflag = 0xE1;
@@ -881,6 +1022,10 @@ public:
     uint8_t readJoyp() const {
         uint8_t r = (joypSelect & 0x30) | 0xC0;
         uint8_t ln = 0x0F;
+        // Con multijugador SGB activo y ambas lineas deseleccionadas, P1
+        // devuelve el ID del joypad actual ($xF=1, $xE=2, $xD=3, $xC=4).
+        if (sgbMultiPlayer && (joypSelect & 0x30) == 0x30)
+            return r | (uint8_t)(0x0F & ~(sgbPlayerIndex & 3));
         if (!(joypSelect & 0x10)) ln &= (buttonsState & 0x0F);
         if (!(joypSelect & 0x20)) ln &= ((buttonsState >> 4) & 0x0F);
         return r | ln;
@@ -1281,7 +1426,15 @@ public:
     void ioWrite(uint16_t addr, uint8_t v) {
         if (addr >= 0xFF10 && addr <= 0xFF3F) { apu.write(addr, v); return; }
         switch (addr) {
-            case 0xFF00: joypSelect = v & 0x30; return;
+            case 0xFF00: {
+                uint8_t prev = joypSelect;
+                joypSelect = v & 0x30;
+                // P15 LOW->HIGH hace avanzar el joypad seleccionado (SGB).
+                if (sgbMultiPlayer && (prev & 0x20) == 0 && (joypSelect & 0x20))
+                    sgbPlayerIndex = (sgbPlayerIndex + 1) % sgbPlayerCount;
+                sgbWriteP1(v);
+                return;
+            }
             case 0xFF01: sb = v; return;
             case 0xFF02:
                 sc = v;
@@ -1681,6 +1834,10 @@ public:
         io(dmaActive); io(dmaIndex); io(dmaReg); io(dmaSrc); io(dmaPendingSrc); io(dmaStartDelay); io(mbc1Multicart);
         io(divCounter); io(tima); io(tma); io(tac); io(timaState);
         io(sb); io(sc); io(serialCycles); io(joypSelect); io(buttonsState);
+        io(sgbP1Prev); io(sgbPhase); io(sgbByteIndex); io(sgbBitCount); io(sgbBitBuf);
+        io(sgbMultiPlayer); io(sgbPlayerCount); io(sgbPlayerIndex);
+        io(sgbPacket); io(sgbTileData); io(sgbMapData); io(sgbPalData);
+        io(sgbHasTiles); io(sgbHasMap); io(sgbBorderFromPacket); io(sgbDecodedBorder);
         io(lcdc); io(stat); io(scy); io(scx); io(ly); io(lyReg); io(lyc); io(wy); io(wx);
         io(bgp); io(obp0); io(obp1); io(lineDot); io(mode3End); io(ppuMode); io(statLine);
         io(lcdFirstLine); io(wyTriggered); io(windowInternalLine); io(frameBuf);
@@ -1712,6 +1869,87 @@ int  g_window_scale = 2;
 
 bool g_audio_enabled = true;
 
+// ---------------------------------------------------------------------------
+// Carga de bordes externos. Formato propio ".sgb" (cabecera "SGBR"):
+//   0x00  "SGBR"   4 bytes
+//   0x04  u32 width   (256)
+//   0x08  u32 height  (224)
+//   0x0C  width*height u32 RGB888 (0 = transparente)
+// Tambien se acepta un BMP de 256x224 sin comprimir (24 bpp).
+// ---------------------------------------------------------------------------
+static bool CargarBordeSgbExterno(const char* path, uint32_t* out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (d.size() < 16) return false;
+    if (d[0] == 'S' && d[1] == 'G' && d[2] == 'B' && d[3] == 'R') {
+        uint32_t w = d[4] | (d[5] << 8) | (d[6] << 16) | ((uint32_t)d[7] << 24);
+        uint32_t h = d[8] | (d[9] << 8) | (d[10] << 16) | ((uint32_t)d[11] << 24);
+        if (w != SGB_W || h != SGB_H || d.size() < 12 + (size_t)w * h * 4) return false;
+        for (size_t i = 0; i < (size_t)w * h; ++i) {
+            const uint8_t* p = &d[12 + i * 4];
+            out[i] = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+        }
+        return true;
+    }
+    if (d[0] == 'B' && d[1] == 'M') {   // BMP sin comprimir, 24 bpp
+        uint32_t off = d[10] | (d[11] << 8) | (d[12] << 16) | ((uint32_t)d[13] << 24);
+        int32_t w = (int32_t)(d[18] | (d[19] << 8) | (d[20] << 16) | ((uint32_t)d[21] << 24));
+        int32_t h = (int32_t)(d[22] | (d[23] << 8) | (d[24] << 16) | ((uint32_t)d[25] << 24));
+        uint16_t bpp = (uint16_t)(d[28] | (d[29] << 8));
+        if (bpp != 24 || w != SGB_W || (h != SGB_H && h != -SGB_H)) return false;
+        bool topDown = h < 0; int ah = h < 0 ? -h : h;
+        size_t row = ((size_t)w * 3 + 3) & ~3u;
+        if (d.size() < off + row * ah) return false;
+        for (int y = 0; y < SGB_H; ++y) {
+            int sy = topDown ? y : (ah - 1 - y);
+            for (int x = 0; x < SGB_W; ++x) {
+                const uint8_t* p = &d[off + sy * row + (size_t)x * 3];
+                out[y * SGB_W + x] = ((uint32_t)p[2] << 16) | ((uint32_t)p[1] << 8) | p[0];
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// Busca un borde externo: .\<rom>.sgb, .\borders\<rom>.sgb o .\border.sgb.
+static bool BuscarBordeSgbExterno(const char* romBase) {
+    char p[MAX_PATH];
+    if (romBase && romBase[0]) {
+        wsprintfA(p, ".\\%s.sgb", romBase);
+        if (CargarBordeSgbExterno(p, g_sgbBuffer)) return true;
+        wsprintfA(p, ".\\borders\\%s.sgb", romBase);
+        if (CargarBordeSgbExterno(p, g_sgbBuffer)) return true;
+        wsprintfA(p, ".\\borders\\%s.bmp", romBase);
+        if (CargarBordeSgbExterno(p, g_sgbBuffer)) return true;
+    }
+    if (CargarBordeSgbExterno(".\\border.sgb", g_sgbBuffer)) return true;
+    if (CargarBordeSgbExterno(".\\border.bmp", g_sgbBuffer)) return true;
+    return false;
+}
+
+// Reconstruye el borde activo: prioriza el borde real enviado por la ROM,
+// luego un archivo externo, y por ultimo el estilo de reserva del modo.
+// Si `Force SGB Border` esta desactivado, los juegos sin borde propio se
+// muestran sin borde (comportamiento autentico del SGB).
+void InitSgbBorder(int mode) {
+    g_sgb_border_active = ModeUsesBorder(mode);
+    if (!g_sgb_border_active) return;
+    if (g_bus.sgbBorderFromPacket) {
+        memcpy(g_sgbBuffer, g_bus.sgbDecodedBorder, sizeof(g_sgbBuffer));
+        g_sgb_border_index = -1;   // marca: borde real de la ROM
+        return;
+    }
+    if (BuscarBordeSgbExterno(g_rom_base_name)) { g_sgb_border_index = -2; return; }
+    if (!g_force_sgb_border) { g_sgb_border_active = false; g_sgb_border_index = 0; return; }
+    int theme = (g_sgb_theme_pref >= 0) ? g_sgb_theme_pref : SgbThemeForMode(mode);
+    g_sgb_border_index = theme;
+    const SgbTheme& t = kSgbThemes[theme];
+    GenerarBordeSgb(theme, t.base, t.accent, t.extra);
+}
+
+
 bool g_auto_fire_enabled[2] = { false, false };   // 0=A, 1=B
 int  g_auto_fire_counter[2]  = { 0, 0 };
 const int AUTO_FIRE_FRAMES = 10;  // toggle cada 10 frames (~6 Hz)
@@ -1738,6 +1976,9 @@ WNDPROC g_origEditProc[MAX_ACTIONS][4] = { nullptr };
 #define ID_SYSTEM_AUTO   40040
 #define ID_SYSTEM_DMG    40041
 #define ID_AUDIO_TOGGLE  40050
+#define ID_SGB_FORCE     40051
+#define ID_SGB_THEME_AUTO 40052
+#define ID_SGB_THEME_BASE 40060   // + indice de estilo (SGB_THEME_COUNT)
 
 void ActualizarMenuDeEstados(HWND hWnd);
 
@@ -1855,6 +2096,10 @@ void GuardarConfiguracionIni() {
     WritePrivateProfileStringA("Audio", "Enabled", szVal, szPath);
     wsprintfA(szVal, "%d", g_model_pref);
     WritePrivateProfileStringA("System", "Model", szVal, szPath);
+    wsprintfA(szVal, "%d", g_force_sgb_border ? 1 : 0);
+    WritePrivateProfileStringA("System", "ForceSgbBorder", szVal, szPath);
+    wsprintfA(szVal, "%d", g_sgb_theme_pref);
+    WritePrivateProfileStringA("System", "BorderStyle", szVal, szPath);
 }
 
 void CargarConfiguracionIni() {
@@ -1871,6 +2116,9 @@ void CargarConfiguracionIni() {
     g_audio_enabled = GetPrivateProfileIntA("Audio", "Enabled", 1, szPath) != 0;
     g_model_pref = GetPrivateProfileIntA("System", "Model", 0, szPath);
     if (g_model_pref < 0 || g_model_pref >= SYSTEM_MODE_COUNT) g_model_pref = SYS_AUTO;
+    g_force_sgb_border = GetPrivateProfileIntA("System", "ForceSgbBorder", 0, szPath) != 0;
+    g_sgb_theme_pref = GetPrivateProfileIntA("System", "BorderStyle", -1, szPath);
+    if (g_sgb_theme_pref < -1 || g_sgb_theme_pref >= SGB_THEME_COUNT) g_sgb_theme_pref = -1;
     InitSgbBorder(g_model_pref);
 }
 
@@ -1885,9 +2133,24 @@ void CrearMenusExtra(HWND hWnd) {
     AppendMenuA(hOption, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hSystem, "&System");
     AppendMenuA(hOption, MF_STRING, ID_AUDIO_TOGGLE, "&Audio");
+    AppendMenuA(hOption, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hOption, MF_STRING, ID_SGB_FORCE, "Force SGB &Border");
+    HMENU hTheme = CreatePopupMenu();
+    AppendMenuA(hTheme, MF_STRING, ID_SGB_THEME_AUTO, "&Automatico (segun el modo)");
+    AppendMenuA(hTheme, MF_SEPARATOR, 0, NULL);
+    for (int t = 0; t < SGB_THEME_COUNT; ++t)
+        AppendMenuA(hTheme, MF_STRING, ID_SGB_THEME_BASE + t, kSgbThemes[t].name);
+    AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hTheme, "Border &Style");
     CheckMenuRadioItem(hMenu, ID_SYSTEM_AUTO, ID_SYSTEM_AUTO + SYSTEM_MODE_COUNT - 1,
                        ID_SYSTEM_AUTO + g_model_pref, MF_BYCOMMAND);
     CheckMenuItem(hMenu, ID_AUDIO_TOGGLE, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(hMenu, ID_SGB_FORCE, g_force_sgb_border ? MF_CHECKED : MF_UNCHECKED);
+    if (g_sgb_theme_pref < 0)
+        CheckMenuRadioItem(hMenu, ID_SGB_THEME_AUTO, ID_SGB_THEME_BASE + SGB_THEME_COUNT - 1,
+                           ID_SGB_THEME_AUTO, MF_BYCOMMAND);
+    else
+        CheckMenuRadioItem(hMenu, ID_SGB_THEME_AUTO, ID_SGB_THEME_BASE + SGB_THEME_COUNT - 1,
+                           ID_SGB_THEME_BASE + g_sgb_theme_pref, MF_BYCOMMAND);
     DrawMenuBar(hWnd);
 }
 
@@ -2136,6 +2399,11 @@ bool CargarRomDesdeRuta(HWND hWnd, const char* szFile) {
     char* dot = strrchr(g_rom_base_name, '.');
     if (dot) *dot = '\0';
     CargarSramCartucho();
+    // El borde real de la ROM se recibe por paquetes SGB al arrancar; hay que
+    // reencuadrar la ventana cuando llegue (se detecta en el bucle principal).
+    g_sgb_border_checked = false;
+    InitSgbBorder(g_model_pref);
+    ResizeEmulatorWindow(hWnd, g_window_scale);
     memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
     g_emulation_paused = false;
     ActualizarEstadoMenusArchivo(hWnd);
@@ -2284,6 +2552,12 @@ void MostrarAcercaDe(HWND hWnd) {
         "- Modos Super Game Boy con borde (256x224):\n"
         "  Game Boy, Game Boy Color + SGB Border y\n"
         "  Game Boy Color + Initial SGB Border\n"
+        "- Bordes SGB reales: se decodifican los paquetes\n"
+        "  CHR_TRN/PCT_TRN de la ROM (Pokemon Yellow,\n"
+        "  Gold/Silver, etc.)\n"
+        "- Force SGB Border: muestra un borde aunque el\n"
+        "  juego no incluya uno (estilos tipo Pokemon)\n"
+        "- Bordes externos: <rom>.sgb / <rom>.bmp 256x224\n"
         "- Speedup Toggle: tecla mapeable que acelera\n"
         "  la emulaci\xF3n mientras se mantiene pulsada\n"
         "- Auto A / Auto B mapeables (disparo autom\xE1tico)\n"
@@ -2395,6 +2669,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                 }
             }
+            if (LOWORD(wp) == ID_SGB_FORCE) {
+                g_force_sgb_border = !g_force_sgb_border;
+                CheckMenuItem(hM, ID_SGB_FORCE, g_force_sgb_border ? MF_CHECKED : MF_UNCHECKED);
+                InitSgbBorder(g_model_pref);
+                ResizeEmulatorWindow(hWnd, g_window_scale);
+                GuardarConfiguracionIni();
+            }
+            if (LOWORD(wp) == ID_SGB_THEME_AUTO) {
+                g_sgb_theme_pref = -1;
+                CheckMenuRadioItem(hM, ID_SGB_THEME_AUTO, ID_SGB_THEME_BASE + SGB_THEME_COUNT - 1,
+                                   ID_SGB_THEME_AUTO, MF_BYCOMMAND);
+                InitSgbBorder(g_model_pref);
+                GuardarConfiguracionIni();
+            }
+            if (LOWORD(wp) >= ID_SGB_THEME_BASE && LOWORD(wp) < ID_SGB_THEME_BASE + SGB_THEME_COUNT) {
+                g_sgb_theme_pref = LOWORD(wp) - ID_SGB_THEME_BASE;
+                CheckMenuRadioItem(hM, ID_SGB_THEME_AUTO, ID_SGB_THEME_BASE + SGB_THEME_COUNT - 1,
+                                   LOWORD(wp), MF_BYCOMMAND);
+                if (!g_force_sgb_border) { g_force_sgb_border = true; CheckMenuItem(hM, ID_SGB_FORCE, MF_CHECKED); }
+                InitSgbBorder(g_model_pref);
+                GuardarConfiguracionIni();
+            }
             if (LOWORD(wp) == ID_STATE_SAVE) { if (g_rom_loaded) EjecutarSaveState(hWnd); else MessageBoxA(hWnd, "Carga una ROM primero.", "Aviso", MB_OK); }
             if (LOWORD(wp) == ID_STATE_LOAD) { if (g_rom_loaded) EjecutarLoadState(hWnd); else MessageBoxA(hWnd, "Carga una ROM primero.", "Aviso", MB_OK); }
             if (LOWORD(wp) >= ID_SLOT_0 && LOWORD(wp) <= ID_SLOT_9) {
@@ -2500,6 +2796,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                     if (g_sgb_border_active) ComponerFrameSgb();
                     // [v0.4] Auto Fire
                     ActualizarAutoFire();
+                }
+                // Si el juego envio su borde SGB (CHR_TRN/PCT_TRN) tras arrancar,
+                // se aplica una sola vez y se reencuadra la ventana. Tiene
+                // prioridad sobre el estilo de reserva (index >= 0).
+                if (ModeUsesBorder(g_model_pref) && !g_sgb_border_checked &&
+                    g_bus.sgbBorderFromPacket && (!g_sgb_border_active || g_sgb_border_index >= 0)) {
+                    g_sgb_border_checked = true;
+                    InitSgbBorder(g_model_pref);
+                    ResizeEmulatorWindow(hWnd, g_window_scale);
                 }
                 EnviarFrameAudio();				
                 InvalidateRect(hWnd, NULL, FALSE);

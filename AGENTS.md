@@ -59,6 +59,27 @@ Compiling just the source (`-c`) is a fast syntax check.
 - The Key Setting dialog captures Tab as a binding (no focus navigation) so
   Speedup can be mapped to Tab.
 
+## SGB borders (v0.8.1)
+- Real borders are decoded from the ROM: games send `CHR_TRN` ($13) and
+  `PCT_TRN` ($14) packets over JOYP (`FF00`), and the emulator renders the
+  result. `Bus::sgbWriteP1` receives the ICD2 bit protocol (start pulse =
+  `P14=P15=0`, bit 0 = `P14` low, bit 1 = `P15` low, 16 bytes LSB-first).
+- Border data format: 256 tiles x 32 bytes (4bpp, two interleaved GB tiles),
+  a 32x28 tilemap, and three 16-color RGB555 palettes (SNES palettes 4-6).
+  **Color index 0 of each palette is transparent** (this is what carves out the
+  160x144 game window) — it is NOT bit 15 of the color.
+- SGB detection: in SGB modes (`ModeIsSgb`) `reset()` sets `C=0x14` so games
+  enable SGB features; `MLT_REQ` ($11) enables multiplayer and `readJoyp`
+  returns the joypad ID (`$xE` = player 2, etc.) when both P14/P15 are high.
+- Border priority in `InitSgbBorder`: real ROM border (`sgbBorderFromPacket`)
+  > external file > fallback style (only when `Force SGB Border` is on).
+- `Force SGB Border` (`[System] ForceSgbBorder`) draws a themed border even for
+  games that ship none; `Border Style` (`[System] BorderStyle`, -1 = auto)
+  selects a `kSgbThemes` style (Pokemon Yellow/Gold/Silver/Red/Blue, Zelda...).
+- External borders: `.<rom>.sgb`, `.\borders\<rom>.sgb` / `.bmp` or
+  `.\border.sgb` / `.bmp`. `.sgb` = header "SGBR" + u32 w, u32 h, w*h u32 RGB.
+- Save-state version is 9 (`kStateVersion`); SGB decoder state is serialized.
+
 ## C++ style notes
 - Spanish user-facing strings.
 - Use octal escapes (`\341`) for accented characters inside string literals —
