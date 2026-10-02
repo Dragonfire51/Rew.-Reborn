@@ -72,6 +72,9 @@ make -f Makefile.win9x test     # core tests (host build, REW_HEADLESS)
 - Keep `resource.rc` line endings as CRLF.
 
 ## Features (v0.8)
+- v0.8.4 reflects Devin's latest fixes: Tomb Raider graphics/audio glitch
+  fixes, the Pokemon Crystal WRAM-banking fix, new Extra functions and several
+  bug fixes (documented in the About dialog).
 - `Option > System` modes: Auto, Game Boy (DMG), Super Game Boy,
   Game Boy + SGB Border, Game Boy Color + SGB Border and
   Game Boy Color + Initial SGB Border. Stored in the ini as
@@ -126,7 +129,7 @@ make -f Makefile.win9x test     # core tests (host build, REW_HEADLESS)
 - Save-state version is 9 (`kStateVersion`); SGB decoder state is serialized.
 
 ## Window title
-- `g_window_base_title` is the base ("Rew. Reborn v0.8.3-alpha"); the loaded
+- `g_window_base_title` is the base ("Rew. Reborn v0.8.4-alpha"); the loaded
   cartridge is shown as `"<base> - <ROM> - <FPS>"`. The ROM name comes from the
   header title (`0x134..0x143`, `EstablecerNombreRom`) or the filename.
 - The title is refreshed both on ROM load/free (`ActualizarTituloVentana`) and

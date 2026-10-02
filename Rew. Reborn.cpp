@@ -5,6 +5,10 @@
 //   existen SetWindowLongPtrA/GetWindowLongPtrA (solo NT), asi que se mapean a
 //   SetWindowLongA/GetWindowLongA; el nivel de API baja a _WIN32_WINNT 0x0400.
 //   Requiere 32 bits: un PE32+ (64-bit) no arranca en Windows 9x.
+// v0.8.4-alpha: refleja los arreglos de la nueva version de Devin.
+//   - Tomb Raider: corregidos glitches graficos y de audio.
+//   - Pokemon Crystal: corregida la banca WRAM.
+//   - Nuevas funciones Extra y correccion de varios bugs.
 // v0.8.3-alpha: corrige el tono del audio (la musica sonaba mas grave).
 //   - waveOutSetPlaybackRate espera un multiplicador de punto fijo (1.0 =
 //     0x10000), no una frecuencia en Hz; se pasaban 44100/176400 y el tono
@@ -183,7 +187,7 @@ bool g_sgb_capture_pending = false;
 uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
 int  g_sgb_captured_count = 0;
 char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
-char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.8.3-alpha";
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.8.4-alpha";
 // Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
 // modo que el sonido conserva su tono mientras la emulacion acelera. Si el
 // dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
@@ -2830,9 +2834,14 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v0.8.3-alpha\n"
+        "Rew. Reborn v0.8.4-alpha\n"
         "Emulador Game Boy / Game Boy Color\n"
         "Port Windows 9x/ME y Windows de 32 bits (i686)\n\n"
+        "Novedades v0.8.4 (cambios de Devin):\n"
+        "- Tomb Raider: corregidos glitches gr\341ficos y de audio\n"
+        "- Pokemon Crystal: corregida la banca WRAM\n"
+        "- Nuevas funciones Extra\n"
+        "- Correcci\xF3n de varios bugs\n\n"
         "- Modos Super Game Boy con borde (256x224):\n"
         "  Game Boy, Game Boy Color + SGB Border y\n"
         "  Game Boy Color + Initial SGB Border\n"
@@ -3052,7 +3061,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     RECT rc = {0, 0, (g_sgb_border_active ? SGB_W : GB_WIDTH) * g_window_scale,
                (g_sgb_border_active ? SGB_H : GB_HEIGHT) * g_window_scale};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
-    HWND hWnd = CreateWindowExA(0, "RewRebornClass", "Rew. Reborn v0.8.3-alpha", WS_OVERLAPPEDWINDOW,
+    HWND hWnd = CreateWindowExA(0, "RewRebornClass", g_window_base_title, WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, hInst, NULL);
     ShowWindow(hWnd, nShow); UpdateWindow(hWnd);
 
@@ -3061,6 +3070,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     CheckMenuRadioItem(GetMenu(hWnd), ID_VIDEO_X1, ID_VIDEO_X4,
                        ID_VIDEO_X1 + (g_window_scale - 1), MF_BYCOMMAND);
     CrearMenusExtra(hWnd);
+
+    // Carga opcional de ROM por linea de comandos: rew_reborn.exe <rom.gb>
+    if (lpCmd && lpCmd[0]) {
+        char ruta[MAX_PATH];
+        if (lpCmd[0] == '"') {
+            int i = 1, j = 0;
+            while (lpCmd[i] && lpCmd[i] != '"' && j < MAX_PATH - 1) ruta[j++] = lpCmd[i++];
+            ruta[j] = '\0';
+        } else {
+            lstrcpynA(ruta, lpCmd, MAX_PATH);
+        }
+        if (ruta[0]) CargarRomDesdeRuta(hWnd, ruta);
+    }
 
     LARGE_INTEGER qpcFreq, lastFrameTime;
     QueryPerformanceFrequency(&qpcFreq);
