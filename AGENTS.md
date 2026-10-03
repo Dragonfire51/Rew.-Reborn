@@ -71,7 +71,33 @@ make -f Makefile.win9x test     # core tests (host build, REW_HEADLESS)
   `ProductVersion` strings; both can be patched in place (same byte length).
 - Keep `resource.rc` line endings as CRLF.
 
-## Features (v0.8)
+## Features (v0.9)
+- v0.9.1 adds a proper wall-clock RTC for MBC3 clock cartridges. The old code
+  advanced `rtcRegs` from CPU cycles (`rtcTick(dots)` in `tickM`), so the clock
+  froze while paused and ran 4x during Speedup. Now the registers hold civil
+  time and `rtcSync()` resolves `rtcRegs + (now - rtcBase)` on every RTC access
+  (`cartRamRead`/`cartRamWrite`/`rtcLatch`/`batteryData`), so the clock advances
+  in real time regardless of pause or Speedup. `rtcSetFromWallClock()` seeds it
+  from `time()`/`gmtime()` when a clock cart is loaded with no `.sav`;
+  `loadBatteryData()` resumes from the saved time and applies the elapsed
+  seconds. The halt (bit 6) and carry (bit 7) flags and the 0x00->0x01 latch
+  command are honoured. Toggle with `Option > System > Real Time Clock (RTC)`
+  (`g_rtc_enabled`, ini `[System] RealTimeClock`); `Poner RTC a la hora del
+  sistema` reseeds it. RTC state is `mutable` so the const cart reads can sync;
+  save-state version is 10.
+- v0.9.0 adds a real-time `Option > Video > Filter` submenu with 12 filters:
+  None, 2xSaI, Super 2xSaI, Super Eagle, Advance MAME Scale2x, Bilinear,
+  Bilinear Plus, Scanlines, TV Mode, Simple 2X, Simple 3x and Simple 4x.
+  The `Option > Video` popup now holds two submenus: `Size` (x1-x4, the old
+  size items) and `Filter` (runtime-menu IDs `ID_FILTER_BASE + n`, built in
+  `CrearMenusExtra`). The active filter is stored in the ini as `[Video]
+  Filter` and applied in `AplicarFiltroVideo()` to the whole displayed frame
+  (GB 160x144 or SGB 256x224, including the border), output to
+  `g_displayBuffer` (up to 1024x896 for SGB 4x); `WM_PAINT` stretches that
+  buffer to the window. `ResizeEmulatorWindow` accounts for the filter
+  magnification (`kFilterMag`) times the Size scale. Filter implementations
+  are the classic Kreed/Andrea Mazzoleni scalers (GPL-2.0, as used by VBA-M)
+  adapted to 0x00RRGGBB 32-bit buffers.
 - v0.8.4 reflects Devin's latest fixes: Tomb Raider graphics/audio glitch
   fixes, the Pokemon Crystal WRAM-banking fix, new Extra functions and several
   bug fixes (documented in the About dialog).
@@ -133,10 +159,10 @@ make -f Makefile.win9x test     # core tests (host build, REW_HEADLESS)
   selects a `kSgbThemes` style (Pokemon Yellow/Gold/Silver/Red/Blue, Zelda...).
 - External borders: `.<rom>.sgb`, `.\borders\<rom>.sgb` / `.bmp` or
   `.\border.sgb` / `.bmp`. `.sgb` = header "SGBR" + u32 w, u32 h, w*h u32 RGB.
-- Save-state version is 9 (`kStateVersion`); SGB decoder state is serialized.
+- Save-state version is 10 (`kStateVersion`); SGB decoder state is serialized.
 
 ## Window title
-- `g_window_base_title` is the base ("Rew. Reborn v0.8.4-alpha"); the loaded
+- `g_window_base_title` is the base ("Rew. Reborn v0.9.1-alpha"); the loaded
   cartridge is shown as `"<base> - <ROM> - <FPS>"`. The ROM name comes from the
   header title (`0x134..0x143`, `EstablecerNombreRom`) or the filename.
 - The title is refreshed both on ROM load/free (`ActualizarTituloVentana`) and

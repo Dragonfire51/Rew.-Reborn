@@ -33,10 +33,13 @@ BEGIN
     BEGIN
         POPUP "&Video"
         BEGIN
-            MENUITEM "x1 Size",          40019
-            MENUITEM "x2 Size",          40020, CHECKED
-            MENUITEM "x3 Size",          40021
-            MENUITEM "x4 Size",          40022
+            POPUP "&Size"
+            BEGIN
+                MENUITEM "x1",          40019
+                MENUITEM "x2",          40020, CHECKED
+                MENUITEM "x3",          40021
+                MENUITEM "x4",          40022
+            END
         END
         MENUITEM "&Key",                 40029
     END
@@ -129,8 +132,8 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 205, 192, 50, 14
 	END
 1 VERSIONINFO
-FILEVERSION     0,8,4,0
-PRODUCTVERSION  0,8,4,0
+FILEVERSION     0,9,1,0
+PRODUCTVERSION  0,9,1,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS__WINDOWS32
@@ -143,11 +146,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Rew. Reborn"
             VALUE "FileDescription",  "Game Boy / Game Boy Color Emulator"
-            VALUE "FileVersion",      "0.8.4.0"
+            VALUE "FileVersion",      "0.9.1.0"
             VALUE "InternalName",     "rew_reborn"
             VALUE "OriginalFilename", "rew_reborn.exe"
             VALUE "ProductName",      "Rew. Reborn"
-            VALUE "ProductVersion",   "0.8.4-alpha"
+            VALUE "ProductVersion",   "0.9.1-alpha"
         END
     END
     BLOCK "VarFileInfo"
