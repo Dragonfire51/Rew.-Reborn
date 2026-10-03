@@ -1,5 +1,24 @@
 // ============================================================================
 // Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
+// v0.9.1-alpha: RTC real (reloj en tiempo real) de los cartuchos MBC3.
+//   - El reloj del cartucho sigue la hora civil del PC: avanza en tiempo real,
+//     tambien con la emulacion pausada, y ya no se acelera con el Speedup
+//     (antes se contaba por ciclos de CPU, lo que congelaba el reloj en pausa
+//     y lo multiplicaba x4 durante el Speedup).
+//   - Se inicializa desde la hora del sistema al cargar una ROM sin .sav y, al
+//     cargar un .sav, se reanuda desde la hora guardada aplicando el tiempo
+//     transcurrido (los relojes de Pokemon Oro/Plata/Cristal avanzan solos).
+//   - Respetan las banderas halt (bit 6) y carry (bit 7) y el latch de 0x01.
+//   - Menu System: "Real Time Clock (RTC)" (activar/desactivar) y "Poner RTC
+//     a la hora del sistema"; se persiste en el ini ([System] RealTimeClock).
+// v0.9.0-alpha: filtros de video y reorganizacion del menu Video.
+//   - El menu Video se reorganiza en dos submenus: Size (x1-x4) y Filter.
+//   - Submenu Filter con 12 filtros en tiempo real: None, 2xSaI,
+//     Super 2xSaI, Super Eagle, Advance MAME Scale2x, Bilinear,
+//     Bilinear Plus, Scanlines, TV Mode, Simple 2X, Simple 3x y Simple 4x.
+//   - El filtro se aplica al fotograma (GB 160x144 o SGB 256x224) y el
+//     resultado se estira a la ventana segun Size.
+//   - El filtro activo se persiste en el ini ([Video] Filter).
 // v0.8.4-alpha: refleja los arreglos de la nueva version de Devin.
 //   - Tomb Raider: corregidos glitches graficos y de audio.
 //   - Pokemon Crystal: corregida la banca WRAM.
@@ -70,6 +89,12 @@ bool g_rom_loaded = false;
 // 0 = automático (GBC si el cartucho lo soporta), 1 = forzar DMG
 int g_model_pref = 0;
 
+// [v0.9.1] RTC real (MBC3): si esta activo, el reloj del cartucho sigue la
+// hora civil del PC (avanza en tiempo real, tambien en pausa, y no se acelera
+// con el Speedup). Si se desactiva, el reloj queda congelado en el ultimo
+// valor. Se persiste en el ini como [System] RealTimeClock.
+bool g_rtc_enabled = true;
+
 // ============================================================================
 // [v0.8] Super Game Boy: borde 256x224 alrededor del area de juego 160x144.
 // El borde se genera por procedimiento (sin tablas gigantes) a partir de un
@@ -99,7 +124,7 @@ bool g_sgb_capture_pending = false;
 uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
 int  g_sgb_captured_count = 0;
 char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
-char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.8.4-alpha";
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.9.1-alpha";
 // Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
 // modo que el sonido conserva su tono mientras la emulacion acelera. Si el
 // dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
@@ -622,7 +647,7 @@ constexpr uint8_t APU::kDuty[4][8];
 class Bus {
 public:
     static constexpr uint32_t kStateMagic = 0x52455742; // "REWB"
-    static constexpr uint32_t kStateVersion = 9;
+    static constexpr uint32_t kStateVersion = 10;
 
     // ------------------------------------------------------------ cartucho
     std::vector<uint8_t> rom;
@@ -635,9 +660,17 @@ public:
     uint8_t ramBank = 0;
     bool ramEnabled = false;
     uint8_t mbcMode = 0;
-    uint8_t rtcRegs[5] = {0}, rtcLatched[5] = {0};
+    // [v0.9.1] RTC real (reloj de pared). `rtcBase` es el instante de reloj en
+    // el que `rtcRegs` era valido; el estado logico del registro se recalcula
+    // siempre como rtcRegs + (ahora - rtcBase), de modo que el reloj avanza en
+    // tiempo real aunque la emulacion este pausada, y no se acelera con el
+    // Speedup (a diferencia del conteo por ciclos de CPU, que se elimino).
+    // Los registros son `mutable` porque las lecturas de cartucho son const
+    // (dmaRead/hdmaReadSrc) y aun asi deben sincronizar el reloj.
+    mutable uint8_t rtcRegs[5] = {0}, rtcLatched[5] = {0};
     uint8_t rtcLatchPrev = 0xFF;
-    uint32_t rtcSubDots = 0;
+    mutable uint64_t rtcBase = 0;   // time_t en que rtcRegs se tomo como valido
+    bool rtcInitialized = false;
 
     // ------------------------------------------------------------ memoria
     std::array<uint8_t, 0x2000> vram{}, vram1{};
@@ -881,6 +914,10 @@ public:
         else isCgbMode = (rom[0x143] & 0x80) != 0;
         ext_ram.fill(0xFF);
         reset();
+        // Cartucho con RTC: parte de la hora civil del sistema. Si existe un
+        // .sav, CargarSramCartucho()/loadBatteryData() lo sobrescribira con el
+        // reloj guardado y el tiempo transcurrido desde entonces.
+        if (hasRtc) rtcSetFromWallClock();
         return true;
     }
 
@@ -897,7 +934,7 @@ public:
         divCounter = isCgbMode ? 0x1EA0 : 0xABCC;
         tima = 0; tma = 0; tac = 0xF8; timaState = 0;
         romBank = 1; ramBank = 0; ramEnabled = (mbcType == 0); mbcMode = 0;
-        rtcLatchPrev = 0xFF; rtcSubDots = 0;
+        rtcLatchPrev = 0xFF; rtcBase = rtcNow();
         dmaActive = false; dmaIndex = 0; dmaReg = 0xFF; dmaSrc = 0; dmaPendingSrc = 0; dmaStartDelay = 0;
         joypSelect = 0x30; buttonsState = 0xFF;
         sgbP1Prev = 0x30; sgbPhase = 0; sgbByteIndex = 0; sgbBitCount = 0; sgbBitBuf = 0;
@@ -964,7 +1001,7 @@ public:
                 }
                 else if (addr < 0x6000) ramBank = v & 0x0F;
                 else {
-                    if (rtcLatchPrev == 0x00 && v == 0x01) memcpy(rtcLatched, rtcRegs, 5);
+                    if (rtcLatchPrev == 0x00 && v == 0x01) rtcLatch();
                     rtcLatchPrev = v;
                 }
                 break;
@@ -990,6 +1027,10 @@ public:
             if (!hasRtc || ramBank > 0x0C) return 0xFF;
             static const uint8_t m[5] = {0x3F, 0x3F, 0x1F, 0xFF, 0xC1};
             int i = ramBank - 8;
+            // El latch es lo que ve el juego; se refresca solo con el comando
+            // 0x00->0x01 (o al escribir un registro). rtcSync() mantiene viva la
+            // hora por si el juego hace un latch despues.
+            rtcSync();
             return (rtcLatched[i] & m[i]) | (uint8_t)~m[i];
         }
         if (ramSize == 0) return 0xFF;
@@ -1003,9 +1044,9 @@ public:
             if (!hasRtc || ramBank > 0x0C) return;
             static const uint8_t m[5] = {0x3F, 0x3F, 0x1F, 0xFF, 0xC1};
             int i = ramBank - 8;
+            rtcSync();                     // consolida la hora actual antes de editar
             rtcRegs[i] = v & m[i];
             rtcLatched[i] = v & m[i];
-            if (i == 0) rtcSubDots = 0;
             return;
         }
         if (ramSize == 0) return;
@@ -1013,52 +1054,79 @@ public:
     }
 
     // ================================================================ RTC
-    void rtcIncSecond() {
-        uint8_t& s = rtcRegs[0]; uint8_t& m = rtcRegs[1]; uint8_t& hr = rtcRegs[2];
-        s = (s + 1) & 0x3F;
-        if (s != 60) return;
-        s = 0; m = (m + 1) & 0x3F;
-        if (m != 60) return;
-        m = 0; hr = (hr + 1) & 0x1F;
-        if (hr != 24) return;
-        hr = 0;
-        uint16_t day = (uint16_t)(rtcRegs[3] | ((rtcRegs[4] & 1) << 8));
-        day++;
-        if (day > 511) { day = 0; rtcRegs[4] |= 0x80; }
-        rtcRegs[3] = day & 0xFF;
-        rtcRegs[4] = (rtcRegs[4] & 0xFE) | ((day >> 8) & 1);
+    // Reloj en tiempo real compatible con MBC3 (segundos, minutos, horas, dias
+    // bajos/altos y las banderas halt / carry). Los registros mantienen la hora
+    // civil del sistema: el juego puede leerlos y escribirlos, y entre lecturas
+    // el reloj avanza con el reloj de pared del PC.
+    static uint64_t rtcNow() { return (uint64_t)time(nullptr); }
+    // Segundos transcurridos desde la base, teniendo en cuenta la bandera halt.
+    uint64_t rtcElapsed() const {
+        uint64_t now = rtcNow();
+        if (now <= rtcBase) return 0;
+        return now - rtcBase;
     }
-    void rtcAdvanceSeconds(uint64_t secs) {
-        if (!hasRtc || (rtcRegs[4] & 0x40) || secs == 0) return;
-        if (rtcRegs[0] < 60 && rtcRegs[1] < 60 && rtcRegs[2] < 24) {
-            uint64_t day = rtcRegs[3] | ((rtcRegs[4] & 1) << 8);
-            uint64_t total = rtcRegs[0] + rtcRegs[1] * 60ULL + rtcRegs[2] * 3600ULL + day * 86400ULL + secs;
-            rtcRegs[0] = total % 60; total /= 60;
-            rtcRegs[1] = total % 60; total /= 60;
-            rtcRegs[2] = total % 24; total /= 24;
-            if (total > 511) rtcRegs[4] |= 0x80;
-            total %= 512;
-            rtcRegs[3] = total & 0xFF;
-            rtcRegs[4] = (rtcRegs[4] & 0xFE) | ((total >> 8) & 1);
-        } else {
-            if (secs > 100000) secs = 100000;
-            while (secs--) rtcIncSecond();
-        }
+    // Hace que rtcRegs refleje el instante actual (resuelve el tiempo
+    // transcurrido desde rtcBase y reinicia la base). Los 9 bits de dias, el
+    // bit de carry y los limites 60/60/24 se respetan como en el hardware.
+    void rtcSync() const {
+        if (!hasRtc || !rtcInitialized) return;
+        if (rtcRegs[4] & 0x40) { rtcBase = rtcNow(); return; }   // en halt
+        if (!g_rtc_enabled) { rtcBase = rtcNow(); return; }      // RTC real desactivado
+        uint64_t secs = rtcElapsed();
+        if (secs == 0) return;
+        uint64_t day = (uint64_t)(rtcRegs[3] | ((rtcRegs[4] & 1) << 8));
+        uint64_t total = (uint64_t)rtcRegs[0] + (uint64_t)rtcRegs[1] * 60ULL +
+                         (uint64_t)rtcRegs[2] * 3600ULL + day * 86400ULL + secs;
+        rtcRegs[0] = (uint8_t)(total % 60); total /= 60;
+        rtcRegs[1] = (uint8_t)(total % 60); total /= 60;
+        rtcRegs[2] = (uint8_t)(total % 24); total /= 24;
+        if (total > 511) rtcRegs[4] |= 0x80;   // desbordamiento del contador
+        total %= 512;
+        rtcRegs[3] = (uint8_t)(total & 0xFF);
+        rtcRegs[4] = (uint8_t)((rtcRegs[4] & 0xFE) | ((total >> 8) & 1));
+        rtcBase = rtcNow();
     }
-    void rtcTick(int dots) {
-        if (!hasRtc || (rtcRegs[4] & 0x40)) return;
-        rtcSubDots += dots;
-        while (rtcSubDots >= 4194304) { rtcSubDots -= 4194304; rtcIncSecond(); }
+    // Fija la hora civil del PC en los registros (arranque de un cartucho RTC
+    // sin .sav). `time_t` es UTC; no se aplica desplazamiento de zona horaria
+    // para que el reloj sea monotonico y estable.
+    void rtcSetFromWallClock() {
+        if (!hasRtc) return;
+        time_t t = (time_t)rtcNow();
+        struct tm tmv;
+        memset(&tmv, 0, sizeof(tmv));
+#if defined(_MSC_VER)
+        gmtime_s(&tmv, &t);
+#else
+        struct tm* tp = gmtime(&t);
+        if (tp) tmv = *tp;
+#endif
+        uint16_t day = (uint16_t)(tmv.tm_yday + 365);   // dias desde 1900
+        rtcRegs[0] = (uint8_t)tmv.tm_sec;
+        rtcRegs[1] = (uint8_t)tmv.tm_min;
+        rtcRegs[2] = (uint8_t)tmv.tm_hour;
+        rtcRegs[3] = (uint8_t)(day & 0xFF);
+        rtcRegs[4] = (uint8_t)((day >> 8) & 1);
+        memcpy(rtcLatched, rtcRegs, 5);
+        rtcBase = rtcNow();
+        rtcInitialized = true;
+
+    }
+    // Copia los registros activos a los latch (comando LATCH_CLOCK = 0x01).
+    void rtcLatch() {
+        if (!hasRtc) return;
+        rtcSync();
+        memcpy(rtcLatched, rtcRegs, 5);
     }
 
     // Formato .sav: RAM + (si hay RTC) bloque de 48 bytes compatible con BGB/VBA
-    std::vector<uint8_t> batteryData() const {
+    std::vector<uint8_t> batteryData() {
+        rtcSync();   // consolida la hora de pared antes de volcar los registros
         std::vector<uint8_t> out(ext_ram.begin(), ext_ram.begin() + ramSize);
         if (hasRtc) {
             auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) out.push_back((v >> (8 * i)) & 0xFF); };
             for (int i = 0; i < 5; ++i) put32(rtcRegs[i]);
             for (int i = 0; i < 5; ++i) put32(rtcLatched[i]);
-            uint64_t t = (uint64_t)time(nullptr);
+            uint64_t t = rtcNow();
             for (int i = 0; i < 8; ++i) out.push_back((t >> (8 * i)) & 0xFF);
         }
         return out;
@@ -1073,8 +1141,14 @@ public:
             for (int i = 0; i < 5; ++i) rtcLatched[i] = (uint8_t)get32(20 + i * 4);
             uint64_t saved = get32(40);
             if (in.size() >= (size_t)ramSize + 48) saved |= (uint64_t)get32(44) << 32;
-            uint64_t now = (uint64_t)time(nullptr);
-            if (saved && now > saved) rtcAdvanceSeconds(now - saved);
+            // El reloj guardado se toma como valido en el instante en que se
+            // guardo; al cargar, rtcSync() aplicara el tiempo transcurrido desde
+            // entonces (si la partida siguio parada, el reloj habra avanzado).
+            rtcBase = saved ? saved : rtcNow();
+            rtcInitialized = true;
+
+        } else if (hasRtc) {
+            rtcSetFromWallClock();
         }
     }
 
@@ -1611,7 +1685,6 @@ public:
         int dots = dotsPerM();
         for (int i = 0; i < dots; ++i) ppuDot();
         apu.run(dots);
-        rtcTick(dots);
         frameDots += dots;
     }
 
@@ -1889,7 +1962,8 @@ public:
     // ================================================================ save states
     template <class F> void serialize(F& io) {
         io(ext_ram); io(mbcType); io(hasRtc); io(hasBattery); io(ramSize); io(romBank); io(ramBank);
-        io(ramEnabled); io(mbcMode); io(rtcRegs); io(rtcLatched); io(rtcLatchPrev); io(rtcSubDots);
+        io(ramEnabled); io(mbcMode); io(rtcRegs); io(rtcLatched); io(rtcLatchPrev);
+        io(rtcBase); io(rtcInitialized);
         io(vram); io(vram1); io(wram); io(oam); io(hram); io(ie); io(iflag);
         io(isCgbMode); io(vbk); io(svbk); io(key1Armed); io(opri); io(ff72); io(ff73); io(ff74); io(ff75);
         io(cgbDoubleSpeed); io(bgPaletteRam); io(objPaletteRam); io(bcps); io(ocps);
@@ -1921,6 +1995,488 @@ void ComponerFrameSgb() {
     for (int y = 0; y < SGB_VH; ++y)
         for (int x = 0; x < SGB_VW; ++x)
             g_sgbBuffer[(SGB_VY + y) * SGB_W + (SGB_VX + x)] = g_bus.frameBuf[y * GB_WIDTH + x];
+}
+
+// ============================================================================
+// [v0.9.0] Filtros de video (submenu Filter) y buffer de presentacion.
+//
+// Cada filtro aumenta la imagen del juego (o del fotograma SGB completo) a un
+// multiplo entero (2x/3x/4x) y escribe el resultado en `g_displayBuffer`. El
+// WM_PAINT estira ese buffer al tamanho de la ventana (Size). Los filtros que
+// duplican con interpolacion (2xSaI, Super2xSaI, SuperEagle, AdvanceMAME
+// Scale2x, Bilinear, Bilinear Plus, Scanlines, TV Mode, Simple 2X) vienen de
+// las implementaciones clasicas de Kreed/Andrea Mazzoleni (GPL-2.0) usadas por
+// VisualBoyAdvance-M, adaptadas a un buffer 0x00RRGGBB de 32 bits.
+// ============================================================================
+enum { FILTER_NONE = 0, FILTER_2XSAI = 1, FILTER_SUPER2XSAI = 2,
+       FILTER_SUPEREAGLE = 3, FILTER_ADMAME2X = 4, FILTER_BILINEAR = 5,
+       FILTER_BILINEAR_PLUS = 6, FILTER_SCANLINES = 7, FILTER_TVMODE = 8,
+       FILTER_SIMPLE2X = 9, FILTER_SIMPLE3X = 10, FILTER_SIMPLE4X = 11,
+       FILTER_COUNT = 12 };
+
+static const int kFilterMag[FILTER_COUNT] = {1,2,2,2,2,2,2,2,2,2,3,4};
+
+// Filtro de video activo (indice del array g_filter_names / kFilterMag).
+int g_video_filter = FILTER_NONE;
+
+#ifndef REW_HEADLESS
+static const char* g_filter_names[FILTER_COUNT] = {
+    "None", "2xSaI", "Super 2xSaI", "Super Eagle",
+    "Advance MAME Scale2x", "Bilinear", "Bilinear Plus",
+    "Scanlines", "TV Mode", "Simple 2X", "Simple 3x", "Simple 4x"
+};
+#endif
+
+// Buffer de salida del filtro: 4x del fotograma SGB (256x224 -> 1024x896).
+static const int MAX_FILT_W = 1024;
+static const int MAX_FILT_H = 896;
+uint32_t g_displayBuffer[MAX_FILT_W * MAX_FILT_H];
+int g_displayW = 0, g_displayH = 0;   // dims del buffer filtrado (0 = usar el crudo)
+
+static inline uint32_t filtClampPix(const uint32_t* src, int w, int h, int x, int y) {
+    if (x < 0) x = 0; else if (x >= w) x = w - 1;
+    if (y < 0) y = 0; else if (y >= h) y = h - 1;
+    return src[y * w + x];
+}
+// Promedio de dos pixeles por canal (preserva 0x00RRGGBB).
+static inline uint32_t filtAvg(uint32_t A, uint32_t B) {
+    if (A == B) return A;
+    uint32_t r = ((A >> 16) + (B >> 16)) >> 1;
+    uint32_t g = (((A >> 8) & 0xFF) + ((B >> 8) & 0xFF)) >> 1;
+    uint32_t b = ((A & 0xFF) + (B & 0xFF)) >> 1;
+    return (r << 16) | (g << 8) | b;
+}
+// Promedio de cuatro pixeles por canal.
+static inline uint32_t filtAvg4(uint32_t A, uint32_t B, uint32_t C, uint32_t D) {
+    uint32_t r = ((A >> 16) + (B >> 16) + (C >> 16) + (D >> 16)) >> 2;
+    uint32_t g = (((A >> 8) & 0xFF) + ((B >> 8) & 0xFF) + ((C >> 8) & 0xFF) + ((D >> 8) & 0xFF)) >> 2;
+    uint32_t b = ((A & 0xFF) + (B & 0xFF) + (C & 0xFF) + (D & 0xFF)) >> 2;
+    return (r << 16) | (g << 8) | b;
+}
+
+static inline int filtGetResult(uint32_t A, uint32_t B, uint32_t C, uint32_t D) {
+    int x = 0, y = 0, r = 0;
+    if (A == C) ++x; else if (B == C) ++y;
+    if (A == D) ++x; else if (B == D) ++y;
+    if (x <= 1) ++r;
+    if (y <= 1) --r;
+    return r;
+}
+static inline int filtGetResult1(uint32_t A, uint32_t B, uint32_t C, uint32_t D) {
+    return filtGetResult(A, B, C, D);
+}
+static inline int filtGetResult2(uint32_t A, uint32_t B, uint32_t C, uint32_t D) {
+    int x = 0, y = 0, r = 0;
+    if (A == C) ++x; else if (B == C) ++y;
+    if (A == D) ++x; else if (B == D) ++y;
+    if (x <= 1) --r;
+    if (y <= 1) ++r;
+    return r;
+}
+
+// -- 2xSaI (2x) --
+static void filt2xSai(const uint32_t* src, int w, int h, uint32_t* dst) {
+    for (int y = 0; y < h; ++y) {
+        uint32_t* dP = dst + y * 2 * w * 2;
+        for (int x = 0; x < w; ++x) {
+            uint32_t colorA = filtClampPix(src, w, h, x, y);
+            uint32_t colorB = filtClampPix(src, w, h, x + 1, y);
+            uint32_t colorC = filtClampPix(src, w, h, x, y + 1);
+            uint32_t colorD = filtClampPix(src, w, h, x + 1, y + 1);
+            uint32_t colorE = filtClampPix(src, w, h, x, y - 1);
+            uint32_t colorF = filtClampPix(src, w, h, x + 1, y - 1);
+            uint32_t colorG = filtClampPix(src, w, h, x - 1, y);
+            uint32_t colorH = filtClampPix(src, w, h, x - 1, y + 1);
+            uint32_t colorI = filtClampPix(src, w, h, x - 1, y - 1);
+            uint32_t colorJ = filtClampPix(src, w, h, x + 2, y - 1);
+            uint32_t colorK = filtClampPix(src, w, h, x + 2, y);
+            uint32_t colorL = filtClampPix(src, w, h, x + 2, y + 1);
+            uint32_t colorM = filtClampPix(src, w, h, x - 1, y + 2);
+            uint32_t colorN = filtClampPix(src, w, h, x, y + 2);
+            uint32_t colorO = filtClampPix(src, w, h, x + 1, y + 2);
+            uint32_t colorP = filtClampPix(src, w, h, x + 2, y + 2);
+            uint32_t product, product1, product2;
+
+            if ((colorA == colorD) && (colorB != colorC)) {
+                if (((colorA == colorE) && (colorB == colorL)) ||
+                    ((colorA == colorC) && (colorA == colorF) && (colorB != colorE) && (colorB == colorJ)))
+                    product = colorA;
+                else
+                    product = filtAvg(colorA, colorB);
+                if (((colorA == colorG) && (colorC == colorO)) ||
+                    ((colorA == colorB) && (colorA == colorH) && (colorG != colorC) && (colorC == colorM)))
+                    product1 = colorA;
+                else
+                    product1 = filtAvg(colorA, colorC);
+                product2 = colorA;
+            } else if ((colorB == colorC) && (colorA != colorD)) {
+                if (((colorB == colorF) && (colorA == colorH)) ||
+                    ((colorB == colorE) && (colorB == colorD) && (colorA != colorF) && (colorA == colorI)))
+                    product = colorB;
+                else
+                    product = filtAvg(colorA, colorB);
+                if (((colorC == colorH) && (colorA == colorF)) ||
+                    ((colorC == colorG) && (colorC == colorD) && (colorA != colorH) && (colorA == colorI)))
+                    product1 = colorC;
+                else
+                    product1 = filtAvg(colorA, colorC);
+                product2 = colorB;
+            } else if ((colorA == colorD) && (colorB == colorC)) {
+                if (colorA == colorB) {
+                    product = product1 = product2 = colorA;
+                } else {
+                    int r = 0;
+                    product1 = filtAvg(colorA, colorC);
+                    product = filtAvg(colorA, colorB);
+                    r += filtGetResult1(colorA, colorB, colorG, colorE);
+                    r += filtGetResult2(colorB, colorA, colorK, colorF);
+                    r += filtGetResult2(colorB, colorA, colorH, colorN);
+                    r += filtGetResult1(colorA, colorB, colorL, colorO);
+                    if (r > 0) product2 = colorA;
+                    else if (r < 0) product2 = colorB;
+                    else product2 = filtAvg4(colorA, colorB, colorC, colorD);
+                }
+            } else {
+                product2 = filtAvg4(colorA, colorB, colorC, colorD);
+                if ((colorA == colorC) && (colorA == colorF) && (colorB != colorE) && (colorB == colorJ))
+                    product = colorA;
+                else if ((colorB == colorE) && (colorB == colorD) && (colorA != colorF) && (colorA == colorI))
+                    product = colorB;
+                else
+                    product = filtAvg(colorA, colorB);
+                if ((colorA == colorB) && (colorA == colorH) && (colorG != colorC) && (colorC == colorM))
+                    product1 = colorA;
+                else if ((colorC == colorG) && (colorC == colorD) && (colorA != colorH) && (colorA == colorI))
+                    product1 = colorC;
+                else
+                    product1 = filtAvg(colorA, colorC);
+            }
+            dP[0] = colorA;
+            dP[1] = product;
+            dP[w * 2] = product1;
+            dP[w * 2 + 1] = product2;
+            dP += 2;
+        }
+    }
+}
+
+// -- Super 2xSaI (2x) --
+static void filtSuper2xSai(const uint32_t* src, int w, int h, uint32_t* dst) {
+    for (int y = 0; y < h; ++y) {
+        uint32_t* dP = dst + y * 2 * w * 2;
+        for (int x = 0; x < w; ++x) {
+            uint32_t colorB0 = filtClampPix(src, w, h, x - 1, y - 1);
+            uint32_t colorB1 = filtClampPix(src, w, h, x, y - 1);
+            uint32_t colorB2 = filtClampPix(src, w, h, x + 1, y - 1);
+            uint32_t colorB3 = filtClampPix(src, w, h, x + 2, y - 1);
+            uint32_t color4 = filtClampPix(src, w, h, x - 1, y);
+            uint32_t color5 = filtClampPix(src, w, h, x, y);
+            uint32_t color6 = filtClampPix(src, w, h, x + 1, y);
+            uint32_t colorS2 = filtClampPix(src, w, h, x + 2, y);
+            uint32_t color1 = filtClampPix(src, w, h, x - 1, y + 1);
+            uint32_t color2 = filtClampPix(src, w, h, x, y + 1);
+            uint32_t color3 = filtClampPix(src, w, h, x + 1, y + 1);
+            uint32_t colorS1 = filtClampPix(src, w, h, x + 2, y + 1);
+            uint32_t colorA0 = filtClampPix(src, w, h, x - 1, y + 2);
+            uint32_t colorA1 = filtClampPix(src, w, h, x, y + 2);
+            uint32_t colorA2 = filtClampPix(src, w, h, x + 1, y + 2);
+            uint32_t colorA3 = filtClampPix(src, w, h, x + 2, y + 2);
+            uint32_t product1a, product1b, product2a, product2b;
+
+            if (color2 == color6 && color5 != color3) {
+                product2b = product1b = color2;
+            } else if (color5 == color3 && color2 != color6) {
+                product2b = product1b = color5;
+            } else if (color5 == color3 && color2 == color6) {
+                int r = 0;
+                r += filtGetResult(color6, color5, color1, colorA1);
+                r += filtGetResult(color6, color5, color4, colorB1);
+                r += filtGetResult(color6, color5, colorA2, colorS1);
+                r += filtGetResult(color6, color5, colorB2, colorS2);
+                if (r > 0) product2b = product1b = color6;
+                else if (r < 0) product2b = product1b = color5;
+                else product2b = product1b = filtAvg(color5, color6);
+            } else {
+                if (color6 == color3 && color3 == colorA1 && color2 != colorA2 && color3 != colorA0)
+                    product2b = filtAvg4(color3, color3, color3, color2);
+                else if (color5 == color2 && color2 == colorA2 && colorA1 != color3 && color2 != colorA3)
+                    product2b = filtAvg4(color2, color2, color2, color3);
+                else
+                    product2b = filtAvg(color2, color3);
+
+                if (color6 == color3 && color6 == colorB1 && color5 != colorB2 && color6 != colorB0)
+                    product1b = filtAvg4(color6, color6, color6, color5);
+                else if (color5 == color2 && color5 == colorB2 && colorB1 != color6 && color5 != colorB3)
+                    product1b = filtAvg4(color6, color5, color5, color5);
+                else
+                    product1b = filtAvg(color5, color6);
+            }
+
+            if (color5 == color3 && color2 != color6 && color4 == color5 && color5 != colorA2)
+                product2a = filtAvg(color2, color5);
+            else if (color5 == color1 && color6 == color5 && color4 != color2 && color5 != colorA0)
+                product2a = filtAvg(color2, color5);
+            else
+                product2a = color2;
+
+            if (color2 == color6 && color5 != color3 && color1 == color2 && color2 != colorB2)
+                product1a = filtAvg(color2, color5);
+            else if (color4 == color2 && color3 == color2 && color1 != color5 && color2 != colorB0)
+                product1a = filtAvg(color2, color5);
+            else
+                product1a = color5;
+
+            dP[0] = product1a;
+            dP[1] = product1b;
+            dP[w * 2] = product2a;
+            dP[w * 2 + 1] = product2b;
+            dP += 2;
+        }
+    }
+}
+
+// -- Super Eagle (2x) --
+static void filtSuperEagle(const uint32_t* src, int w, int h, uint32_t* dst) {
+    for (int y = 0; y < h; ++y) {
+        uint32_t* dP = dst + y * 2 * w * 2;
+        for (int x = 0; x < w; ++x) {
+            uint32_t colorB1 = filtClampPix(src, w, h, x, y - 1);
+            uint32_t colorB2 = filtClampPix(src, w, h, x + 1, y - 1);
+            uint32_t color4 = filtClampPix(src, w, h, x - 1, y);
+            uint32_t color5 = filtClampPix(src, w, h, x, y);
+            uint32_t color6 = filtClampPix(src, w, h, x + 1, y);
+            uint32_t colorS2 = filtClampPix(src, w, h, x + 2, y);
+            uint32_t color1 = filtClampPix(src, w, h, x - 1, y + 1);
+            uint32_t color2 = filtClampPix(src, w, h, x, y + 1);
+            uint32_t color3 = filtClampPix(src, w, h, x + 1, y + 1);
+            uint32_t colorS1 = filtClampPix(src, w, h, x + 2, y + 1);
+            uint32_t colorA1 = filtClampPix(src, w, h, x, y + 2);
+            uint32_t colorA2 = filtClampPix(src, w, h, x + 1, y + 2);
+            uint32_t product1a, product1b, product2a, product2b;
+
+            if (color2 == color6 && color5 != color3) {
+                product1b = product2a = color2;
+                if ((color1 == color2) || (color6 == colorB2)) {
+                    product1a = filtAvg(color2, color5);
+                    product1a = filtAvg(color2, product1a);
+                } else {
+                    product1a = filtAvg(color5, color6);
+                }
+                if ((color6 == colorS2) || (color2 == colorA1)) {
+                    product2b = filtAvg(color2, color3);
+                    product2b = filtAvg(color2, product2b);
+                } else {
+                    product2b = filtAvg(color2, color3);
+                }
+            } else if (color5 == color3 && color2 != color6) {
+                product2b = product1a = color5;
+                if ((colorB1 == color5) || (color3 == colorS1)) {
+                    product1b = filtAvg(color5, color6);
+                    product1b = filtAvg(color5, product1b);
+                } else {
+                    product1b = filtAvg(color5, color6);
+                }
+                if ((color3 == colorA2) || (color4 == color5)) {
+                    product2a = filtAvg(color5, color2);
+                    product2a = filtAvg(color5, product2a);
+                } else {
+                    product2a = filtAvg(color2, color3);
+                }
+            } else if (color5 == color3 && color2 == color6) {
+                int r = 0;
+                r += filtGetResult(color6, color5, color1, colorA1);
+                r += filtGetResult(color6, color5, color4, colorB1);
+                r += filtGetResult(color6, color5, colorA2, colorS1);
+                r += filtGetResult(color6, color5, colorB2, colorS2);
+                if (r > 0) {
+                    product1b = product2a = color2;
+                    product1a = product2b = filtAvg(color5, color6);
+                } else if (r < 0) {
+                    product2b = product1a = color5;
+                    product1b = product2a = filtAvg(color5, color6);
+                } else {
+                    product2b = product1a = color5;
+                    product1b = product2a = color2;
+                }
+            } else {
+                product2b = product1a = filtAvg(color2, color6);
+                product2b = filtAvg4(color3, color3, color3, product2b);
+                product1a = filtAvg4(color5, color5, color5, product1a);
+                product2a = product1b = filtAvg(color5, color3);
+                product2a = filtAvg4(color2, color2, color2, product2a);
+                product1b = filtAvg4(color6, color6, color6, product1b);
+            }
+            dP[0] = product1a;
+            dP[1] = product1b;
+            dP[w * 2] = product2a;
+            dP[w * 2 + 1] = product2b;
+            dP += 2;
+        }
+    }
+}
+
+// -- AdvanceMAME Scale2x (2x) --
+// Para cada fila de entrada se generan dos filas de salida: la superior usa
+// (filaArriba, fila, filaAbajo) y la inferior (filaAbajo, fila, filaArriba).
+static void filtAdMame2xRow(uint32_t* d, const uint32_t* s0, const uint32_t* s1,
+                            const uint32_t* s2, int w) {
+    uint32_t A = s0[0];
+    uint32_t B = s1[0];
+    uint32_t C = s2[0];
+    uint32_t E = (w > 1) ? s1[1] : s1[0];
+    d[0] = B;
+    d[1] = (E == A && C != A) ? A : B;
+    for (int x = 1; x < w; ++x) {
+        uint32_t prev = s1[x - 1];
+        uint32_t cur  = s1[x];
+        uint32_t nxt  = (x + 1 < w) ? s1[x + 1] : s1[x];
+        uint32_t up   = s0[x];
+        uint32_t lw   = s2[x];
+        if (up != lw && prev != nxt)
+            d[0] = (prev == up) ? up : cur;
+        else
+            d[0] = cur;
+        if (up != lw && prev != nxt)
+            d[1] = (nxt == up) ? up : cur;
+        else
+            d[1] = cur;
+        d += 2;
+    }
+}
+
+static void filtAdMame2x(const uint32_t* src, int w, int h, uint32_t* dst) {
+    for (int y = 0; y < h; ++y) {
+        const uint32_t* sUp = src + (y > 0 ? y - 1 : y) * w;
+        const uint32_t* s1  = src + y * w;
+        const uint32_t* sDn = src + (y + 1 < h ? y + 1 : y) * w;
+        uint32_t* dTop = dst + (y * 2) * w * 2;
+        uint32_t* dBot = dTop + w * 2;
+        // Fila superior: compara con la fila de arriba; inferior: con la de abajo.
+        filtAdMame2xRow(dTop, sUp, s1, sDn, w);
+        filtAdMame2xRow(dBot, sDn, s1, sUp, w);
+    }
+}
+
+// -- Bilinear (2x) --
+static void filtBilinear(const uint32_t* src, int w, int h, uint32_t* dst) {
+    for (int y = 0; y < h; ++y) {
+        const uint32_t* cur = src + y * w;
+        const uint32_t* nxt = src + (y + 1 < h ? y + 1 : y) * w;
+        uint32_t* d0 = dst + y * 2 * w * 2;
+        uint32_t* d1 = d0 + w * 2;
+        uint32_t a = cur[0], c = nxt[0];
+        for (int x = 0; x < w; ++x) {
+            uint32_t b = cur[(x + 1 < w) ? x + 1 : x];
+            uint32_t d = nxt[(x + 1 < w) ? x + 1 : x];
+            d0[0] = a;
+            d0[1] = filtAvg(a, b);
+            d1[0] = filtAvg(a, c);
+            d1[1] = filtAvg4(a, b, c, d);
+            a = b; c = d;
+            d0 += 2; d1 += 2;
+        }
+    }
+}
+
+// -- Bilinear Plus (2x): version "plus" heredada de VBA-M (Kreed) --
+static void filtBilinearPlus(const uint32_t* src, int w, int h, uint32_t* dst) {
+    for (int y = 0; y < h; ++y) {
+        const uint32_t* cur = src + y * w;
+        const uint32_t* nxt = src + (y + 1 < h ? y + 1 : y) * w;
+        uint32_t* d0 = dst + y * 2 * w * 2;
+        uint32_t* d1 = d0 + w * 2;
+        uint32_t a = cur[0], c = nxt[0];
+        for (int x = 0; x < w; ++x) {
+            uint32_t b = cur[(x + 1 < w) ? x + 1 : x];
+            uint32_t d = nxt[(x + 1 < w) ? x + 1 : x];
+            // upper-left "plus": 5*A + (B+B+C+C) / 8  (variacion VBA-M)
+            uint32_t r = ((a >> 16) * 10 + ((b >> 16) << 1) + ((c >> 16) << 1)) >> 4;
+            uint32_t g = ((((a >> 8) & 0xFF) * 10) + (((b >> 8) & 0xFF) << 1) + (((c >> 8) & 0xFF) << 1)) >> 4;
+            uint32_t bl = ((a & 0xFF) * 10 + ((b & 0xFF) << 1) + ((c & 0xFF) << 1)) >> 4;
+            d0[0] = (r << 16) | (g << 8) | bl;
+            d0[1] = filtAvg(a, b);
+            d1[0] = filtAvg(a, c);
+            d1[1] = filtAvg4(a, b, c, d);
+            a = b; c = d;
+            d0 += 2; d1 += 2;
+        }
+    }
+}
+
+// -- Scanlines (2x): fila duplicada + fila negra --
+static void filtScanlines(const uint32_t* src, int w, int h, uint32_t* dst) {
+    for (int y = 0; y < h; ++y) {
+        const uint32_t* cur = src + y * w;
+        uint32_t* d0 = dst + y * 2 * w * 2;
+        uint32_t* d1 = d0 + w * 2;
+        for (int x = 0; x < w; ++x) {
+            d0[0] = d0[1] = cur[x];
+            d1[0] = d1[1] = 0;
+            d0 += 2; d1 += 2;
+        }
+    }
+}
+
+// -- TV Mode (2x): fila original + interpolada y oscurecida --
+static void filtTvMode(const uint32_t* src, int w, int h, uint32_t* dst) {
+    for (int y = 0; y < h; ++y) {
+        const uint32_t* cur = src + y * w;
+        uint32_t* d0 = dst + y * 2 * w * 2;
+        uint32_t* d1 = d0 + w * 2;
+        for (int x = 0; x < w; ++x) {
+            uint32_t a = cur[x];
+            uint32_t b = cur[(x + 1 < w) ? x + 1 : x];
+            uint32_t interp = filtAvg(a, b);
+            d0[0] = a;
+            d0[1] = interp;
+            // oscurecido: (v>>1)+(v>>2) = v*0.75
+            uint32_t darkA = ((a >> 1) & 0x7F7F7F) + ((a >> 2) & 0x3F3F3F);
+            uint32_t darkI = ((interp >> 1) & 0x7F7F7F) + ((interp >> 2) & 0x3F3F3F);
+            d1[0] = darkA;
+            d1[1] = darkI;
+            d0 += 2; d1 += 2;
+        }
+    }
+}
+
+// -- Simple 2X / 3X / 4X (nearest-neighbour) --
+static void filtSimpleNx(const uint32_t* src, int w, int h, int mag, uint32_t* dst) {
+    for (int y = 0; y < h; ++y) {
+        for (int yy = 0; yy < mag; ++yy) {
+            uint32_t* d = dst + (y * mag + yy) * w * mag;
+            for (int x = 0; x < w; ++x) {
+                uint32_t c = src[y * w + x];
+                for (int xx = 0; xx < mag; ++xx) d[x * mag + xx] = c;
+            }
+        }
+    }
+}
+
+// Aplica el filtro activo al buffer actual (GB o SGB) y actualiza g_displayW/H.
+void AplicarFiltroVideo() {
+    int f = g_video_filter;
+    int w = g_sgb_border_active ? SGB_W : GB_WIDTH;
+    int h = g_sgb_border_active ? SGB_H : GB_HEIGHT;
+    if (f == FILTER_NONE || w <= 0 || h <= 0) { g_displayW = g_displayH = 0; return; }
+    const uint32_t* src = g_sgb_border_active ? g_sgbBuffer : g_screenBuffer;
+    uint32_t* dst = g_displayBuffer;
+    switch (f) {
+        case FILTER_2XSAI:         filt2xSai(src, w, h, dst); break;
+        case FILTER_SUPER2XSAI:    filtSuper2xSai(src, w, h, dst); break;
+        case FILTER_SUPEREAGLE:    filtSuperEagle(src, w, h, dst); break;
+        case FILTER_ADMAME2X:      filtAdMame2x(src, w, h, dst); break;
+        case FILTER_BILINEAR:      filtBilinear(src, w, h, dst); break;
+        case FILTER_BILINEAR_PLUS: filtBilinearPlus(src, w, h, dst); break;
+        case FILTER_SCANLINES:     filtScanlines(src, w, h, dst); break;
+        case FILTER_TVMODE:        filtTvMode(src, w, h, dst); break;
+        default: {
+            int mag = kFilterMag[f];
+            filtSimpleNx(src, w, h, mag, dst);
+            break;
+        }
+    }
+    g_displayW = w * kFilterMag[f];
+    g_displayH = h * kFilterMag[f];
 }
 
 // Multiplicador de punto fijo que espera waveOutSetPlaybackRate: la palabra
@@ -2209,6 +2765,13 @@ WNDPROC g_origEditProc[MAX_ACTIONS][4] = { nullptr };
 #define ID_AUDIO_LPF2     40084
 #define ID_AUDIO_VOL_BASE 40090   // + indice de volumen (kVolumeOptions)
 
+// Submenu Filter (creado en tiempo de ejecucion dentro del Video menu).
+#define ID_FILTER_BASE     40100   // + indice de filtro (FILTER_COUNT)
+
+// RTC (reloj en tiempo real de los cartuchos MBC3): menu System.
+#define ID_RTC_ENABLE      40120   // activar/desactivar el RTC real
+#define ID_RTC_SET_TIME    40121   // poner la hora civil del sistema
+
 void ActualizarMenuDeEstados(HWND hWnd);
 
 // ============================================================================
@@ -2355,6 +2918,8 @@ void GuardarConfiguracionIni() {
         }
     wsprintfA(szVal, "%d", g_window_scale);
     WritePrivateProfileStringA("Video", "Scale", szVal, szPath);
+    wsprintfA(szVal, "%d", g_video_filter);
+    WritePrivateProfileStringA("Video", "Filter", szVal, szPath);
     wsprintfA(szVal, "%d", g_audio_enabled ? 1 : 0);
     WritePrivateProfileStringA("Audio", "Enabled", szVal, szPath);
     wsprintfA(szVal, "%d", g_audio_effect);
@@ -2367,6 +2932,8 @@ void GuardarConfiguracionIni() {
     WritePrivateProfileStringA("System", "ForceSgbBorder", szVal, szPath);
     wsprintfA(szVal, "%d", g_sgb_theme_pref);
     WritePrivateProfileStringA("System", "BorderStyle", szVal, szPath);
+    wsprintfA(szVal, "%d", g_rtc_enabled ? 1 : 0);
+    WritePrivateProfileStringA("System", "RealTimeClock", szVal, szPath);
 }
 
 void CargarConfiguracionIni() {
@@ -2380,6 +2947,8 @@ void CargarConfiguracionIni() {
     g_window_scale = GetPrivateProfileIntA("Video", "Scale", 2, szPath);
     if (g_window_scale < 1) g_window_scale = 1;
     if (g_window_scale > 4) g_window_scale = 4;
+    g_video_filter = GetPrivateProfileIntA("Video", "Filter", FILTER_NONE, szPath);
+    if (g_video_filter < 0 || g_video_filter >= FILTER_COUNT) g_video_filter = FILTER_NONE;
     g_audio_enabled = GetPrivateProfileIntA("Audio", "Enabled", 1, szPath) != 0;
     g_audio_effect = GetPrivateProfileIntA("Audio", "Effect", AUDIO_FX_NONE, szPath);
     if (g_audio_effect < AUDIO_FX_NONE || g_audio_effect > AUDIO_FX_LPF2) g_audio_effect = AUDIO_FX_NONE;
@@ -2391,6 +2960,7 @@ void CargarConfiguracionIni() {
     g_force_sgb_border = GetPrivateProfileIntA("System", "ForceSgbBorder", 0, szPath) != 0;
     g_sgb_theme_pref = GetPrivateProfileIntA("System", "BorderStyle", -1, szPath);
     if (g_sgb_theme_pref < -1 || g_sgb_theme_pref >= SGB_THEME_COUNT) g_sgb_theme_pref = -1;
+    g_rtc_enabled = GetPrivateProfileIntA("System", "RealTimeClock", 1, szPath) != 0;
     InitSgbBorder(g_model_pref);
 }
 
@@ -2399,9 +2969,27 @@ void CrearMenusExtra(HWND hWnd) {
     if (!hMenu) return;
     HMENU hOption = GetSubMenu(hMenu, 2);
     if (!hOption) return;
+
+    // Submenu Filter dentro del Video menu (el primer submenu de Option).
+    HMENU hVideo = GetSubMenu(hOption, 0);
+    if (hVideo) {
+        HMENU hFilter = CreatePopupMenu();
+        for (int f = 0; f < FILTER_COUNT; ++f) {
+            UINT flags = MF_STRING;
+            if (f == 0) flags |= MF_CHECKED;
+            AppendMenuA(hFilter, flags, ID_FILTER_BASE + f, g_filter_names[f]);
+        }
+        AppendMenuA(hVideo, MF_POPUP, (UINT_PTR)hFilter, "&Filter");
+        CheckMenuRadioItem(hVideo, ID_FILTER_BASE, ID_FILTER_BASE + FILTER_COUNT - 1,
+                           ID_FILTER_BASE + g_video_filter, MF_BYCOMMAND);
+    }
+
     HMENU hSystem = CreatePopupMenu();
     for (int m = 0; m < SYSTEM_MODE_COUNT; ++m)
         AppendMenuA(hSystem, MF_STRING, ID_SYSTEM_AUTO + m, g_system_mode_names[m]);
+    AppendMenuA(hSystem, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hSystem, MF_STRING, ID_RTC_ENABLE, "&Real Time Clock (RTC)");
+    AppendMenuA(hSystem, MF_STRING, ID_RTC_SET_TIME, "Poner RTC a la &hora del sistema");
     AppendMenuA(hOption, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hSystem, "&System");
     HMENU hAudio = CreatePopupMenu();
@@ -2443,6 +3031,7 @@ void CrearMenusExtra(HWND hWnd) {
     else
         CheckMenuRadioItem(hMenu, ID_SGB_THEME_AUTO, ID_SGB_THEME_BASE + SGB_THEME_COUNT - 1,
                            ID_SGB_THEME_BASE + g_sgb_theme_pref, MF_BYCOMMAND);
+    CheckMenuItem(hMenu, ID_RTC_ENABLE, g_rtc_enabled ? MF_CHECKED : MF_UNCHECKED);
     DrawMenuBar(hWnd);
 }
 
@@ -2619,8 +3208,9 @@ INT_PTR CALLBACK KeySettingProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ResizeEmulatorWindow(HWND hWnd, int scale) {
-    int w = g_sgb_border_active ? SGB_W : GB_WIDTH;
-    int h = g_sgb_border_active ? SGB_H : GB_HEIGHT;
+    int mag = kFilterMag[g_video_filter >= 0 && g_video_filter < FILTER_COUNT ? g_video_filter : FILTER_NONE];
+    int w = (g_sgb_border_active ? SGB_W : GB_WIDTH) * mag;
+    int h = (g_sgb_border_active ? SGB_H : GB_HEIGHT) * mag;
     RECT rc = {0, 0, w * scale, h * scale};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
     SetWindowPos(hWnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2883,8 +3473,30 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v0.8.4-alpha\n"
+        "Rew. Reborn v0.9.1-alpha\n"
         "Emulador Game Boy / Game Boy Color\n\n"
+        "Novedades v0.9.1:\n"
+        "- RTC real (reloj en tiempo real) para cartuchos MBC3\n"
+        "  con reloj (Pokemon Oro/Plata/Cristal, etc.)\n"
+        "- El reloj sigue la hora del PC: avanza en tiempo real,\n"
+        "  tambien con el emulador en pausa, y no se acelera con\n"
+        "  el Speedup\n"
+        "- Se reanuda desde la hora guardada en el .sav aplicando\n"
+        "  el tiempo transcurrido, o desde la hora del sistema si\n"
+        "  no hay .sav\n"
+        "- Respeta las banderas halt y carry y el latch del reloj\n"
+        "- Menu System: Real Time Clock (RTC) y Poner RTC a la\n"
+        "  hora del sistema ([System] RealTimeClock en el ini)\n\n"
+        "Novedades v0.9.0:\n"
+        "- Menu Video reorganizado en submenus Size (x1-x4)\n"
+        "  y Filter\n"
+        "- Submenu Filter con filtros en tiempo real:\n"
+        "  None, 2xSaI, Super 2xSaI, Super Eagle,\n"
+        "  Advance MAME Scale2x, Bilinear, Bilinear Plus,\n"
+        "  Scanlines, TV Mode, Simple 2X, Simple 3x,\n"
+        "  Simple 4x\n"
+        "- El filtro activo se guarda en el ini ([Video]\n"
+        "  Filter) y se restaura al iniciar\n\n"
         "Novedades v0.8.4 (cambios de Devin):\n"
         "- Tomb Raider: corregidos glitches gr\341ficos y de audio\n"
         "- Pokemon Crystal: corregida la banca WRAM\n"
@@ -3058,6 +3670,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ResizeEmulatorWindow(hWnd, g_window_scale);
                 GuardarConfiguracionIni();
             }
+            if (LOWORD(wp) == ID_RTC_ENABLE) {
+                g_rtc_enabled = !g_rtc_enabled;
+                CheckMenuItem(hM, ID_RTC_ENABLE, g_rtc_enabled ? MF_CHECKED : MF_UNCHECKED);
+                // Al reactivar, fija la base en el instante actual para que el
+                // reloj siga desde la hora que el juego tenia guardada.
+                g_bus.rtcBase = g_bus.rtcNow();
+                GuardarConfiguracionIni();
+            }
+            if (LOWORD(wp) == ID_RTC_SET_TIME) {
+                if (!g_rom_loaded) {
+                    MessageBoxA(hWnd, "Carga una ROM con RTC primero.", "RTC", MB_OK | MB_ICONINFORMATION);
+                } else if (!g_bus.hasRtc) {
+                    MessageBoxA(hWnd, "Esta ROM no tiene RTC (solo MBC3 con reloj).",
+                                "RTC", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    g_bus.rtcSetFromWallClock();
+                    g_rtc_enabled = true;
+                    CheckMenuItem(hM, ID_RTC_ENABLE, MF_CHECKED);
+                    GuardarConfiguracionIni();
+                    MessageBoxA(hWnd, "RTC puesto a la hora del sistema.",
+                                "RTC", MB_OK | MB_ICONINFORMATION);
+                }
+            }
             if (LOWORD(wp) == ID_SGB_THEME_AUTO) {
                 g_sgb_theme_pref = -1;
                 CheckMenuRadioItem(hM, ID_SGB_THEME_AUTO, ID_SGB_THEME_BASE + SGB_THEME_COUNT - 1,
@@ -3087,6 +3722,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_window_scale = scale;
                 GuardarConfiguracionIni();
             }
+            if (LOWORD(wp) >= ID_FILTER_BASE && LOWORD(wp) < ID_FILTER_BASE + FILTER_COUNT) {
+                g_video_filter = LOWORD(wp) - ID_FILTER_BASE;
+                CheckMenuRadioItem(hM, ID_FILTER_BASE, ID_FILTER_BASE + FILTER_COUNT - 1,
+                                   LOWORD(wp), MF_BYCOMMAND);
+                ResizeEmulatorWindow(hWnd, g_window_scale);
+                GuardarConfiguracionIni();
+                InvalidateRect(hWnd, NULL, TRUE);
+                UpdateWindow(hWnd);
+            }
             break;
 
         case WM_PAINT: {
@@ -3095,17 +3739,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT cr;
             GetClientRect(hWnd, &cr);
             SetStretchBltMode(hdc, COLORONCOLOR);
+            bool useFilter = (g_video_filter != FILTER_NONE) && g_displayW > 0 && g_displayH > 0;
+            int srcW = useFilter ? g_displayW : (g_sgb_border_active ? SGB_W : GB_WIDTH);
+            int srcH = useFilter ? g_displayH : (g_sgb_border_active ? SGB_H : GB_HEIGHT);
+            const void* srcBuf = useFilter ? (const void*)g_displayBuffer
+                                           : (const void*)(g_sgb_border_active ? g_sgbBuffer : g_screenBuffer);
             BITMAPINFO bmi = {};
             bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            bmi.bmiHeader.biWidth = g_sgb_border_active ? SGB_W : GB_WIDTH;
-            bmi.bmiHeader.biHeight = g_sgb_border_active ? -SGB_H : -GB_HEIGHT;
+            bmi.bmiHeader.biWidth = srcW;
+            bmi.bmiHeader.biHeight = -srcH;
             bmi.bmiHeader.biPlanes = 1;
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
             StretchDIBits(hdc, 0, 0, cr.right, cr.bottom,
-                          0, 0, bmi.bmiHeader.biWidth, -bmi.bmiHeader.biHeight,
-                          g_sgb_border_active ? g_sgbBuffer : g_screenBuffer,
-                          &bmi, DIB_RGB_COLORS, SRCCOPY);
+                          0, 0, srcW, srcH,
+                          srcBuf, &bmi, DIB_RGB_COLORS, SRCCOPY);
             EndPaint(hWnd, &ps);
             break;
         }
@@ -3140,8 +3788,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     InitCommonControlsEx(&icc);
     RegisterClassExA(&wc);
 
-    RECT rc = {0, 0, (g_sgb_border_active ? SGB_W : GB_WIDTH) * g_window_scale,
-               (g_sgb_border_active ? SGB_H : GB_HEIGHT) * g_window_scale};
+    int magWin = kFilterMag[g_video_filter >= 0 && g_video_filter < FILTER_COUNT ? g_video_filter : FILTER_NONE];
+    RECT rc = {0, 0, (g_sgb_border_active ? SGB_W : GB_WIDTH) * magWin * g_window_scale,
+               (g_sgb_border_active ? SGB_H : GB_HEIGHT) * magWin * g_window_scale};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
     HWND hWnd = CreateWindowExA(0, "RewRebornClass", g_window_base_title, WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, hInst, NULL);
@@ -3199,6 +3848,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                     framesRun++;
                     if (!(g_bus.lcdc & 0x80)) memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
                     if (g_sgb_border_active) ComponerFrameSgb();
+                    AplicarFiltroVideo();
                     // [v0.4] Auto Fire
                     ActualizarAutoFire();
                 }
