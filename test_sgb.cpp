@@ -280,6 +280,65 @@ int main() {
         g_rtc_enabled = true;
     }
 
+    // --- Link Cable (puerto serie) ------------------------------------------
+    {   // Sin cable, una transferencia normal completa con 0xFF.
+        Bus s;
+        g_link_enabled = false;
+        s.sb = 0x42; s.sc = 0;
+        s.ioWrite(0xFF02, 0x81);          // arranca transferencia (reloj interno)
+        check(s.serialCycles > 0, "Link: la transferencia arranca");
+        for (int i = 0; i < 2000 && s.serialCycles > 0; ++i) s.tickM();
+        check(s.sb == 0xFF && (s.sc & 0x80) == 0, "Link: sin cable llega 0xFF");
+    }
+    {   // Con cable, el byte se publica para el rival.
+        Bus s;
+        g_link_enabled = true;
+        g_link.open();
+        g_link.setRole(LinkCable::ROLE_MASTER);
+        s.sb = 0x5A; s.sc = 0;
+        s.ioWrite(0xFF02, 0x81);
+        check(s.serialExternal, "Link: la transferencia se marca como externa");
+        for (int i = 0; i < 2000 && s.serialCycles > 0; ++i) s.tickM();
+        check(s.sb == 0xFF, "Link: sin respuesta del rival llega 0xFF");
+        g_link_enabled = false;
+        g_link.close();
+    }
+    {   // Intercambio: mi transferencia recoge el byte que publico el rival.
+        Bus a;
+        g_link_enabled = true;
+        g_link.open();
+        g_link.setRole(LinkCable::ROLE_MASTER);   // local=0, remote=1
+        a.sb = 0x11; a.sc = 0;
+        a.ioWrite(0xFF02, 0x81);                  // A publica 0x11 en la ranura 0
+        // El rival (otra instancia) publica 0x22 en la ranura 1.
+        g_link.setRole(LinkCable::ROLE_SLAVE);
+        g_link.publish(0x22);
+        g_link.setRole(LinkCable::ROLE_MASTER);   // vuelve a la vista de A
+        for (int i = 0; i < 2000 && a.serialCycles > 0; ++i) a.tickM();
+        check(a.sb == 0x22, "Link: los bytes se intercambian entre las dos instancias");
+        g_link_enabled = false;
+        g_link.close();
+    }
+    {   // Recibir desde el menu expone el byte del rival.
+        g_link_enabled = true;
+        g_link.open();
+        g_link.setRole(LinkCable::ROLE_SLAVE);
+        g_link.publish(0xAB);
+        g_link.setRole(LinkCable::ROLE_MASTER);
+        check(g_link.remoteFresh(), "Link: el byte del rival esta disponible");
+        check(g_link.remoteByte() == 0xAB, "Link: Recibir devuelve el byte del rival");
+        g_link.consumeRemote();
+        check(!g_link.remoteFresh(), "Link: tras consumir ya no esta disponible");
+        g_link_enabled = false;
+        g_link.close();
+    }
+    {   // El rol se persiste como maestro/esclavo.
+        g_link.setRole(LinkCable::ROLE_MASTER);
+        check(g_link.local == LinkCable::ROLE_MASTER, "Link: rol maestro");
+        g_link.setRole(LinkCable::ROLE_SLAVE);
+        check(g_link.local == LinkCable::ROLE_SLAVE, "Link: rol esclavo");
+    }
+
     std::printf(g_fail ? "\nRESULTADO: %d FALLOS\n" : "\nRESULTADO: OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

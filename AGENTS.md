@@ -41,7 +41,21 @@ Compiling just the source (`-c`) is a fast syntax check.
   `ProductVersion` strings; both can be patched in place (same byte length).
 - Keep `resource.rc` line endings as CRLF.
 
-## Features (v0.9)
+## Features (v0.10)
+- v0.10.0 adds a Link Cable (game link) between two emulator instances over
+  shared memory. Each instance owns one 4-byte slot (its side of the cable) plus
+  a lock byte in the file mapping `Local\RewRebornLink` (`LinkCable` in
+  `Rew. Reborn.cpp`); the peer is the other slot. When a game starts an external
+  serial transfer (`SC` = 0x81/0x83, or 0x80 as a slave while the link is on),
+  the emulator publishes `SB` to its slot; when the transfer completes
+  (`tickM` counts `serialCycles` down) it pulls the peer's byte if present,
+  otherwise 0xFF. `Option > Link Cable` has: `Link Cable activado`
+  (enable/disable, `g_link_enabled`, ini `[Link] Enabled`), `Escuchar (modo
+  esclavo)` (sets role to slave), `Recibir byte del rival` (shows the pending
+  peer byte), `Cambiar rol (maestro/esclavo)` (ini `[Link] Role`) and
+  `Reiniciar cable`. With no cable the serial port behaves as before (0xFF).
+  The `REW_HEADLESS` stub keeps the same two-slot model so the logic is
+  testable without Windows.
 - v0.9.1 adds a proper wall-clock RTC for MBC3 clock cartridges. The old code
   advanced `rtcRegs` from CPU cycles (`rtcTick(dots)` in `tickM`), so the clock
   froze while paused and ran 4x during Speedup. Now the registers hold civil
@@ -132,7 +146,7 @@ Compiling just the source (`-c`) is a fast syntax check.
 - Save-state version is 10 (`kStateVersion`); SGB decoder state is serialized.
 
 ## Window title
-- `g_window_base_title` is the base ("Rew. Reborn v0.9.1-alpha"); the loaded
+- `g_window_base_title` is the base ("Rew. Reborn v0.10.0-alpha"); the loaded
   cartridge is shown as `"<base> - <ROM> - <FPS>"`. The ROM name comes from the
   header title (`0x134..0x143`, `EstablecerNombreRom`) or the filename.
 - The title is refreshed both on ROM load/free (`ActualizarTituloVentana`) and

@@ -1,5 +1,13 @@
 // ============================================================================
 // Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
+// v0.10.0-alpha: Link Cable (cable de enlace) entre dos instancias.
+//   - Submenu Option > Link Cable: activar/desactivar, Escuchar (modo esclavo),
+//     Recibir byte del rival, Cambiar rol (maestro/esclavo) y Reiniciar cable.
+//   - El puerto serie (SB/SC, 0xFF01/0xFF02) se enlaza entre dos instancias del
+//     emulador por memoria compartida (CreateFileMappingA "Local\\RewRebornLink"):
+//     cada instancia publica su byte saliente y recoge el del rival, de modo que
+//     dos partidas de Pokemon pueden intercambiar.
+//   - Se persiste en el ini ([Link] Enabled / Role).
 // v0.9.1-alpha: RTC real (reloj en tiempo real) de los cartuchos MBC3.
 //   - El reloj del cartucho sigue la hora civil del PC: avanza en tiempo real,
 //     tambien con la emulacion pausada, y ya no se acelera con el Speedup
@@ -124,7 +132,7 @@ bool g_sgb_capture_pending = false;
 uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
 int  g_sgb_captured_count = 0;
 char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
-char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.9.1-alpha";
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.10.0-alpha";
 // Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
 // modo que el sonido conserva su tono mientras la emulacion acelera. Si el
 // dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
@@ -642,6 +650,125 @@ constexpr uint8_t APU::kReadMask[0x17];
 constexpr uint8_t APU::kDuty[4][8];
 
 // ============================================================================
+// [v0.10.0] Link Cable (puerto serie por memoria compartida).
+//
+// El Game Boy enlaza por el puerto serie (SB/SC, 0xFF01/0xFF02). Este emulador
+// expone un canal de 32 bits por cada direccion de transferencia y un reloj de
+// testigo, ambos en un fichero mapeado en memoria (CreateFileMappingA). Cada
+// instancia posee UN buffer (su lado del cable); el rival es el otro buffer.
+// Cuando un juego arranca una transferencia externa (SC = 0x81/0x83) el
+// esclavo recibe el bit de reloj del maestro y desplaza su byte; al terminar
+// ambos intercambian los bytes por el buffer del rival. Asi dos instancias del
+// emulador con una ROM de Pokemon pueden intercambiar.
+//
+// Para pruebas sin Windows (REW_HEADLESS) el transporte es un stub sin efectos.
+// ============================================================================
+#ifndef REW_HEADLESS
+struct LinkCable {
+    enum { IDLE = 0, LISTEN = 1, RECV = 2 };
+    enum { ROLE_MASTER = 0, ROLE_SLAVE = 1 };
+    static const unsigned kMagic = 0x524C4E4Bu;   // "RLNK"
+    HANDLE hMap = NULL;
+    volatile uint8_t* view = NULL;
+    int local = 0, remote = 1;
+    int state = IDLE;
+    uint8_t pendingByte = 0;
+    bool pendingValid = false;
+
+    void ensureMap() {
+        if (view) return;
+        hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 64,
+                                  "Local\\RewRebornLink");
+        if (!hMap) return;
+        view = (volatile uint8_t*)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 64);
+        if (!view) return;
+        if (*(volatile unsigned*)view != kMagic) {
+            for (int i = 0; i < 64; ++i) view[i] = 0;
+            *(volatile unsigned*)view = kMagic;
+        }
+    }
+    void reset() {
+        ensureMap();
+        if (!view) return;
+        local = 0; remote = 1;
+        view[8 + local * 4 + 0] = 0;
+        view[8 + local * 4 + 1] = 0;
+        view[8 + local * 4 + 2] = 0;
+    }
+    void open() {
+        ensureMap();
+        if (!view) return;
+        state = LISTEN;
+        reset();
+        view[16] = 0;            // testigo libre
+    }
+    void close() {
+        if (view) { view[8 + local * 4 + 0] = 0; view[8 + local * 4 + 1] = 0; }
+        state = IDLE;
+    }
+    void setRole(int role) {
+        local = role;
+        remote = 1 - role;
+    }
+    // Publica un byte recibido (lo consumira el rival si esta escuchando).
+    void publish(uint8_t b) {
+        ensureMap();
+        if (!view) return;
+        view[8 + local * 4 + 0] = b;
+        view[8 + local * 4 + 1] = 1;
+        view[8 + local * 4 + 2] = (uint8_t)state;
+    }
+    // Envia un byte al rival en una transferencia normal (no de escucha).
+    void sendByte(uint8_t b) {
+        ensureMap();
+        if (!view) return;
+        view[8 + local * 4 + 0] = b;
+        view[8 + local * 4 + 1] = 2;   // marca "byte enviado"
+    }
+    bool remoteFresh() const {
+        if (!view) return false;
+        return view[8 + remote * 4 + 1] != 0;
+    }
+    uint8_t remoteByte() const { return view ? view[8 + remote * 4 + 0] : 0; }
+    void consumeRemote() { if (view) view[8 + remote * 4 + 1] = 0; }
+    bool tryAcquire() {
+        if (!view) return false;
+        return __sync_lock_test_and_set((volatile unsigned char*)&view[16], 1) == 0;
+    }
+    void release() { if (view) __sync_lock_release((volatile unsigned char*)&view[16]); }
+};
+#else
+// Stub sin Windows (REW_HEADLESS): mismo modelo de dos ranuras que el
+// transporte real (una por lado del cable), para poder probar la logica.
+struct LinkCable {
+    enum { IDLE = 0, LISTEN = 1, RECV = 2 };
+    enum { ROLE_MASTER = 0, ROLE_SLAVE = 1 };
+    int local = 0, remote = 1, state = IDLE;
+    uint8_t slotVal[2] = {0, 0};
+    uint8_t slotFresh[2] = {0, 0};
+    void ensureMap() {}
+    void reset() { local = 0; remote = 1; slotVal[0] = slotVal[1] = 0; slotFresh[0] = slotFresh[1] = 0; }
+    void open() { state = LISTEN; reset(); }
+    void close() { state = IDLE; }
+    void setRole(int role) { local = role; remote = 1 - role; }
+    void publish(uint8_t b) { slotVal[local] = b; slotFresh[local] = 1; }
+    void sendByte(uint8_t b) { slotVal[local] = b; slotFresh[local] = 2; }
+    bool remoteFresh() const { return slotFresh[remote] != 0; }
+    uint8_t remoteByte() const { return slotVal[remote]; }
+    void consumeRemote() { slotFresh[remote] = 0; }
+    bool tryAcquire() { return true; }
+    void release() {}
+};
+#endif
+
+// Estado global del Link Cable (indice de estado y byte recibido por el
+// usuario desde el menu "Recibir").
+LinkCable g_link;
+int g_link_status = 0;      // 0 = inactivo, 1 = escuchando, 2 = conectado
+int g_link_received = -1;   // ultimo byte recibido (-1 = ninguno)
+bool g_link_enabled = false;
+
+// ============================================================================
 // Bus: cartucho, memoria, timer, PPU, DMA y CPU
 // ============================================================================
 class Bus {
@@ -708,6 +835,9 @@ public:
     uint8_t sb = 0, sc = 0x7E;
     int serialCycles = 0;
     std::string serialOut;
+    // [v0.10.0] Link Cable: transferencia externa en curso y bit de reloj visto.
+    uint8_t serialBit = 0;
+    bool serialExternal = false;
 
     // ------------------------------------------------------------ joypad
     uint8_t joypSelect = 0x30, buttonsState = 0xFF;
@@ -1575,9 +1705,20 @@ public:
             case 0xFF01: sb = v; return;
             case 0xFF02:
                 sc = v;
-                if ((v & 0x81) == 0x81) {
+                // Transferencia clasica (reloj interno, 0x81) o, con el Link
+                // Cable activo, tambien como esclavo (reloj externo, 0x80).
+                if ((v & 0x81) == 0x81 || (g_link_enabled && (v & 0x80))) {
                     serialOut.push_back((char)sb);
                     serialCycles = (isCgbMode && (v & 0x02)) ? 32 : 1024;
+                    // [v0.10.0] Link Cable: publica mi byte saliente para que el
+                    // rival lo recoja al terminar su transferencia.
+                    serialExternal = g_link_enabled;
+                    if (g_link_enabled) {
+                        g_link.publish(sb);
+                        g_link_status = 2;
+                    }
+                } else if ((v & 0x80) == 0) {
+                    serialExternal = false;
                 }
                 return;
             case 0xFF04: writeDiv(); return;
@@ -1679,7 +1820,20 @@ public:
     // ================================================================ reloj
     void tickM() {
         timerTickM();
-        if (serialCycles > 0 && --serialCycles == 0) { sb = 0xFF; sc &= 0x7F; iflag |= 0x08; }
+        if (serialCycles > 0 && --serialCycles == 0) {
+            if (serialExternal && g_link_enabled && g_link.remoteFresh()) {
+                // [v0.10.0] Link Cable: llega el byte del rival (intercambio).
+                sb = g_link.remoteByte();
+                g_link.consumeRemote();
+            } else if (serialExternal && g_link_enabled) {
+                sb = 0xFF;   // el rival no respondio a tiempo (cable desconectado)
+            } else {
+                sb = 0xFF;   // sin cartucho de enlace (comportamiento clasico)
+            }
+            sc &= 0x7F;
+            iflag |= 0x08;
+            serialExternal = false;
+        }
         dmaTickM();
         statModeSnap = ppuMode;
         int dots = dotsPerM();
@@ -1970,7 +2124,7 @@ public:
         io(hdmaSrc); io(hdmaDst); io(hdmaBlocksLeft); io(hdmaActive); io(hdmaStatus); io(stallDots);
         io(dmaActive); io(dmaIndex); io(dmaReg); io(dmaSrc); io(dmaPendingSrc); io(dmaStartDelay); io(mbc1Multicart);
         io(divCounter); io(tima); io(tma); io(tac); io(timaState);
-        io(sb); io(sc); io(serialCycles); io(joypSelect); io(buttonsState);
+        io(sb); io(sc); io(serialCycles); io(serialBit); io(serialExternal); io(joypSelect); io(buttonsState);
         io(sgbP1Prev); io(sgbPhase); io(sgbByteIndex); io(sgbBitCount); io(sgbBitBuf);
         io(sgbMultiPlayer); io(sgbPlayerCount); io(sgbPlayerIndex);
         io(sgbPacket); io(sgbTileData); io(sgbMapData); io(sgbPalData);
@@ -2772,6 +2926,13 @@ WNDPROC g_origEditProc[MAX_ACTIONS][4] = { nullptr };
 #define ID_RTC_ENABLE      40120   // activar/desactivar el RTC real
 #define ID_RTC_SET_TIME    40121   // poner la hora civil del sistema
 
+// Submenu Link Cable (creado en tiempo de ejecucion dentro de Option).
+#define ID_LINK_ENABLE     40140   // activar/desactivar el Link Cable
+#define ID_LINK_LISTEN     40141   // escuchar (modo esclavo / recepcion)
+#define ID_LINK_RECV       40142   // recibir el ultimo byte del rival
+#define ID_LINK_ROLE       40143   // alternar maestro/esclavo
+#define ID_LINK_RESET      40144   // reiniciar el cable
+
 void ActualizarMenuDeEstados(HWND hWnd);
 
 // ============================================================================
@@ -2934,6 +3095,10 @@ void GuardarConfiguracionIni() {
     WritePrivateProfileStringA("System", "BorderStyle", szVal, szPath);
     wsprintfA(szVal, "%d", g_rtc_enabled ? 1 : 0);
     WritePrivateProfileStringA("System", "RealTimeClock", szVal, szPath);
+    wsprintfA(szVal, "%d", g_link_enabled ? 1 : 0);
+    WritePrivateProfileStringA("Link", "Enabled", szVal, szPath);
+    wsprintfA(szVal, "%d", g_link.local);
+    WritePrivateProfileStringA("Link", "Role", szVal, szPath);
 }
 
 void CargarConfiguracionIni() {
@@ -2961,6 +3126,9 @@ void CargarConfiguracionIni() {
     g_sgb_theme_pref = GetPrivateProfileIntA("System", "BorderStyle", -1, szPath);
     if (g_sgb_theme_pref < -1 || g_sgb_theme_pref >= SGB_THEME_COUNT) g_sgb_theme_pref = -1;
     g_rtc_enabled = GetPrivateProfileIntA("System", "RealTimeClock", 1, szPath) != 0;
+    g_link_enabled = GetPrivateProfileIntA("Link", "Enabled", 0, szPath) != 0;
+    g_link.setRole(GetPrivateProfileIntA("Link", "Role", 0, szPath) != 0 ? 1 : 0);
+    if (g_link_enabled) { g_link.open(); g_link_status = 1; }
     InitSgbBorder(g_model_pref);
 }
 
@@ -3016,6 +3184,18 @@ void CrearMenusExtra(HWND hWnd) {
     for (int t = 0; t < SGB_THEME_COUNT; ++t)
         AppendMenuA(hTheme, MF_STRING, ID_SGB_THEME_BASE + t, kSgbThemes[t].name);
     AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hTheme, "Border &Style");
+
+    // [v0.10.0] Submenu Link Cable (intercambio entre dos instancias).
+    HMENU hLink = CreatePopupMenu();
+    AppendMenuA(hLink, MF_STRING, ID_LINK_ENABLE, "&Link Cable activado");
+    AppendMenuA(hLink, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hLink, MF_STRING, ID_LINK_LISTEN, "&Escuchar (modo esclavo)");
+    AppendMenuA(hLink, MF_STRING, ID_LINK_RECV, "&Recibir byte del rival");
+    AppendMenuA(hLink, MF_STRING, ID_LINK_ROLE, "Cambiar &rol (maestro/esclavo)");
+    AppendMenuA(hLink, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hLink, MF_STRING, ID_LINK_RESET, "&Reiniciar cable");
+    AppendMenuA(hOption, MF_POPUP, (UINT_PTR)hLink, "&Link Cable");
+
     CheckMenuRadioItem(hMenu, ID_SYSTEM_AUTO, ID_SYSTEM_AUTO + SYSTEM_MODE_COUNT - 1,
                        ID_SYSTEM_AUTO + g_model_pref, MF_BYCOMMAND);
     CheckMenuItem(hMenu, ID_AUDIO_ON, g_audio_enabled ? MF_CHECKED : MF_UNCHECKED);
@@ -3032,6 +3212,8 @@ void CrearMenusExtra(HWND hWnd) {
         CheckMenuRadioItem(hMenu, ID_SGB_THEME_AUTO, ID_SGB_THEME_BASE + SGB_THEME_COUNT - 1,
                            ID_SGB_THEME_BASE + g_sgb_theme_pref, MF_BYCOMMAND);
     CheckMenuItem(hMenu, ID_RTC_ENABLE, g_rtc_enabled ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(hMenu, ID_LINK_ENABLE, g_link_enabled ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(hMenu, ID_LINK_LISTEN, g_link.state == LinkCable::LISTEN ? MF_CHECKED : MF_UNCHECKED);
     DrawMenuBar(hWnd);
 }
 
@@ -3473,8 +3655,17 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v0.9.1-alpha\n"
+        "Rew. Reborn v0.10.0-alpha\n"
         "Emulador Game Boy / Game Boy Color\n\n"
+        "Novedades v0.10.0:\n"
+        "- Link Cable (cable de enlace) entre dos instancias\n"
+        "  del emulador, por memoria compartida\n"
+        "- Submenu Option > Link Cable: activar/desactivar,\n"
+        "  Escuchar (modo esclavo), Recibir byte del rival,\n"
+        "  Cambiar rol (maestro/esclavo) y Reiniciar cable\n"
+        "- Permite intercambiar en los juegos de Pokemon con\n"
+        "  una segunda instancia corriendo otra ROM\n"
+        "- Se persiste en el ini ([Link] Enabled / Role)\n\n"
         "Novedades v0.9.1:\n"
         "- RTC real (reloj en tiempo real) para cartuchos MBC3\n"
         "  con reloj (Pokemon Oro/Plata/Cristal, etc.)\n"
@@ -3692,6 +3883,55 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
                     MessageBoxA(hWnd, "RTC puesto a la hora del sistema.",
                                 "RTC", MB_OK | MB_ICONINFORMATION);
                 }
+            }
+            if (LOWORD(wp) == ID_LINK_ENABLE) {
+                g_link_enabled = !g_link_enabled;
+                if (g_link_enabled) { g_link.open(); g_link_status = 1; }
+                else { g_link.close(); g_link_status = 0; }
+                CheckMenuItem(hM, ID_LINK_ENABLE, g_link_enabled ? MF_CHECKED : MF_UNCHECKED);
+                GuardarConfiguracionIni();
+            }
+            if (LOWORD(wp) == ID_LINK_LISTEN) {
+                if (!g_link_enabled) {
+                    MessageBoxA(hWnd, "Activa el Link Cable primero.", "Link Cable", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    g_link.open();
+                    g_link.setRole(LinkCable::ROLE_SLAVE);
+                    g_link_status = 1;
+                    CheckMenuItem(hM, ID_LINK_ENABLE, MF_CHECKED);
+                    CheckMenuItem(hM, ID_LINK_LISTEN, MF_CHECKED);
+                    MessageBoxA(hWnd, "Escuchando: modo esclavo. Esperando al rival...",
+                                "Link Cable", MB_OK | MB_ICONINFORMATION);
+                }
+            }
+            if (LOWORD(wp) == ID_LINK_RECV) {
+                if (!g_link_enabled) {
+                    MessageBoxA(hWnd, "Activa el Link Cable primero.", "Link Cable", MB_OK | MB_ICONINFORMATION);
+                } else if (g_link.remoteFresh()) {
+                    g_link_received = g_link.remoteByte();
+                    g_link.consumeRemote();
+                    char msg[96];
+                    wsprintfA(msg, "Byte recibido del rival: 0x%02X ('%c')",
+                              g_link_received, (g_link_received >= 32 && g_link_received < 127) ? g_link_received : '.');
+                    MessageBoxA(hWnd, msg, "Link Cable", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    MessageBoxA(hWnd, "No hay ningun byte del rival disponible.",
+                                "Link Cable", MB_OK | MB_ICONINFORMATION);
+                }
+            }
+            if (LOWORD(wp) == ID_LINK_ROLE) {
+                int nuevo = (g_link.local == LinkCable::ROLE_MASTER) ? LinkCable::ROLE_SLAVE : LinkCable::ROLE_MASTER;
+                g_link.setRole(nuevo);
+                MessageBoxA(hWnd, nuevo == LinkCable::ROLE_MASTER
+                              ? "Rol: MAESTRO (el rival sera esclavo)."
+                              : "Rol: ESCLAVO (escucha al maestro).",
+                            "Link Cable", MB_OK | MB_ICONINFORMATION);
+            }
+            if (LOWORD(wp) == ID_LINK_RESET) {
+                g_link.reset();
+                g_link_received = -1;
+                g_link_status = g_link_enabled ? 1 : 0;
+                MessageBoxA(hWnd, "Cable reiniciado.", "Link Cable", MB_OK | MB_ICONINFORMATION);
             }
             if (LOWORD(wp) == ID_SGB_THEME_AUTO) {
                 g_sgb_theme_pref = -1;
