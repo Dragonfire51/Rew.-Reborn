@@ -41,7 +41,16 @@ Compiling just the source (`-c`) is a fast syntax check.
   `ProductVersion` strings; both can be patched in place (same byte length).
 - Keep `resource.rc` line endings as CRLF.
 
-## Features (v0.10)
+## Features (v1.0)
+- v1.0.0 is the first stable release (end of the "alpha" stage). It rewrites
+  the MBC3 RTC with the real chip semantics: seconds/minutes/hours are 6/6/5-bit
+  counters that wrap 59->0 / 59->0 / 23->0, and a value of 60..63 masks to 0
+  **without** carrying to the next register (so "invalid" times like 28:63:60
+  advance to 28:63:61 and the day is untouched). Unused register bits read back
+  as 0 (not their complement). `rtcAdvanceBinaryExact()` in `rtcSync()` does
+  this; it matches the rtc3test range tests, the 512-day overflow flag and the
+  24h / 1h rollovers while keeping the wall-clock sync (real time, also while
+  paused, not sped up by Speedup).
 - v0.10.0 adds a Link Cable (game link) between two emulator instances over
   shared memory. Each instance owns one 4-byte slot (its side of the cable) plus
   a lock byte in the file mapping `Local\RewRebornLink` (`LinkCable` in
@@ -146,7 +155,7 @@ Compiling just the source (`-c`) is a fast syntax check.
 - Save-state version is 10 (`kStateVersion`); SGB decoder state is serialized.
 
 ## Window title
-- `g_window_base_title` is the base ("Rew. Reborn v0.10.0-alpha"); the loaded
+- `g_window_base_title` is the base ("Rew. Reborn v1.0.0"); the loaded
   cartridge is shown as `"<base> - <ROM> - <FPS>"`. The ROM name comes from the
   header title (`0x134..0x143`, `EstablecerNombreRom`) or the filename.
 - The title is refreshed both on ROM load/free (`ActualizarTituloVentana`) and

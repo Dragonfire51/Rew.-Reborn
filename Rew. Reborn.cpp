@@ -1,5 +1,13 @@
 // ============================================================================
 // Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
+// v1.0.0: primera version estable (fin de la etapa "alpha").
+//   - RTC MBC3 reescrita con la semantica binaria real del chip: los contadores
+//     de segundos/minutos/horas envuelven en 63/63/31 y solo acarrean desde
+//     59/59/23 (antes se normalizaba a tiempo civil 60/60/24, lo que fallaba en
+//     los tests de rango del MBC3: valores "invalidos" como 28:63:60 o el
+//     desbordamiento de 512 dias).
+//   - La RTC conserva la sincronizacion con el reloj de pared del PC (avanza en
+//     tiempo real, tambien en pausa, y no se acelera con el Speedup).
 // v0.10.0-alpha: Link Cable (cable de enlace) entre dos instancias.
 //   - Submenu Option > Link Cable: activar/desactivar, Escuchar (modo esclavo),
 //     Recibir byte del rival, Cambiar rol (maestro/esclavo) y Reiniciar cable.
@@ -132,7 +140,7 @@ bool g_sgb_capture_pending = false;
 uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
 int  g_sgb_captured_count = 0;
 char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
-char g_window_base_title[MAX_PATH] = "Rew. Reborn v0.10.0-alpha";
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v1.0.0";
 // Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
 // modo que el sonido conserva su tono mientras la emulacion acelera. Si el
 // dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
@@ -1159,9 +1167,11 @@ public:
             int i = ramBank - 8;
             // El latch es lo que ve el juego; se refresca solo con el comando
             // 0x00->0x01 (o al escribir un registro). rtcSync() mantiene viva la
-            // hora por si el juego hace un latch despues.
+            // hora por si el juego hace un latch despues. Los bits no usados de
+            // cada registro se leen como 0 (semantica MBC3, verificada por los
+            // tests de rango de rtc3test: "all bits set" y "valid bits").
             rtcSync();
-            return (rtcLatched[i] & m[i]) | (uint8_t)~m[i];
+            return (uint8_t)(rtcLatched[i] & m[i]);
         }
         if (ramSize == 0) return 0xFF;
         return ext_ram[cartRamOffset(addr)];
@@ -1198,22 +1208,44 @@ public:
     // Hace que rtcRegs refleje el instante actual (resuelve el tiempo
     // transcurrido desde rtcBase y reinicia la base). Los 9 bits de dias, el
     // bit de carry y los limites 60/60/24 se respetan como en el hardware.
+    // Avanza el estado RTC `n` segundos con la semantica real del MBC3: los
+    // contadores de segundos/minutos/horas son de 6/6/5 bits y envuelven en
+    // 63->0 / 63->0 / 31->0; el registro siguiente SOLO se incrementa cuando el
+    // anterior valia exactamente 59 (segs/mins) o 23 (horas). Asi se respetan
+    // los tests de rango (valores "invalidos" como 28:63:60 avanzan a 28:63:61
+    // sin tocar el dia). OJO: el campo de horas puede valer 30/31 y el acarreo
+    // solo mira si valia 23.
+    void rtcAdvanceBinaryExact(uint64_t n) const {
+        while (n--) {
+            // Segundos: al pasar de 59 se vuelve 0 y acarrea; al pasar de 63
+            // solo se enmascara a 0 (sin acarrear). En ambos casos el registro
+            // queda a 0; la diferencia es si se propaga el acarreo.
+            uint8_t ns = (uint8_t)(rtcRegs[0] + 1);
+            bool carryS = (ns == 60);
+            rtcRegs[0] = carryS ? 0 : (uint8_t)(ns & 0x3F);
+            if (!carryS) continue;
+            uint8_t nm = (uint8_t)(rtcRegs[1] + 1);
+            bool carryM = (nm == 60);
+            rtcRegs[1] = carryM ? 0 : (uint8_t)(nm & 0x3F);
+            if (!carryM) continue;
+            uint8_t nh = (uint8_t)(rtcRegs[2] + 1);
+            bool carryH = (nh == 24);
+            rtcRegs[2] = carryH ? 0 : (uint8_t)(nh & 0x1F);
+            if (!carryH) continue;
+            uint16_t day = (uint16_t)(rtcRegs[3] | ((rtcRegs[4] & 1) << 8));
+            day = (uint16_t)((day + 1) & 0x1FF);
+            if (day == 0) rtcRegs[4] |= 0x80;  // 511 -> 0: bandera de desbordamiento
+            rtcRegs[3] = (uint8_t)(day & 0xFF);
+            rtcRegs[4] = (uint8_t)((rtcRegs[4] & 0xFE) | ((day >> 8) & 1));
+        }
+    }
     void rtcSync() const {
         if (!hasRtc || !rtcInitialized) return;
         if (rtcRegs[4] & 0x40) { rtcBase = rtcNow(); return; }   // en halt
         if (!g_rtc_enabled) { rtcBase = rtcNow(); return; }      // RTC real desactivado
         uint64_t secs = rtcElapsed();
         if (secs == 0) return;
-        uint64_t day = (uint64_t)(rtcRegs[3] | ((rtcRegs[4] & 1) << 8));
-        uint64_t total = (uint64_t)rtcRegs[0] + (uint64_t)rtcRegs[1] * 60ULL +
-                         (uint64_t)rtcRegs[2] * 3600ULL + day * 86400ULL + secs;
-        rtcRegs[0] = (uint8_t)(total % 60); total /= 60;
-        rtcRegs[1] = (uint8_t)(total % 60); total /= 60;
-        rtcRegs[2] = (uint8_t)(total % 24); total /= 24;
-        if (total > 511) rtcRegs[4] |= 0x80;   // desbordamiento del contador
-        total %= 512;
-        rtcRegs[3] = (uint8_t)(total & 0xFF);
-        rtcRegs[4] = (uint8_t)((rtcRegs[4] & 0xFE) | ((total >> 8) & 1));
+        rtcAdvanceBinaryExact(secs);
         rtcBase = rtcNow();
     }
     // Fija la hora civil del PC en los registros (arranque de un cartucho RTC
@@ -3655,9 +3687,13 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v0.10.0-alpha\n"
+        "Rew. Reborn v1.0.0\n"
         "Emulador Game Boy / Game Boy Color\n\n"
-        "Novedades v0.10.0:\n"
+        "Novedades v1.0.0 (estable):\n"
+        "- RTC MBC3 reescrita con la semantica binaria\n"
+        "  real del chip (envoltura 63/63/31 y acarreo\n"
+        "  desde 59/59/23), corregidos los tests de rango\n"
+        "  del MBC3 y el desbordamiento de 512 dias\n"
         "- Link Cable (cable de enlace) entre dos instancias\n"
         "  del emulador, por memoria compartida\n"
         "- Submenu Option > Link Cable: activar/desactivar,\n"
