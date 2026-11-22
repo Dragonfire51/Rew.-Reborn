@@ -23,6 +23,8 @@ static void sgbSendPacket(Bus& b, const uint8_t* p) {
 
 int main() {
     Bus& b = g_bus;
+    // El protocolo ICD2 solo se decodifica en modos SGB.
+    g_model_pref = SYS_GB_SGB;
 
     // --- Prepara datos de tiles en VRAM 0x8800 (tile 1 = color index 1) ------
     b.vram.fill(0);
@@ -62,6 +64,7 @@ int main() {
     g_model_pref = SYS_AUTO;
     b.reset();
     check(b.c == 0x13, "modo Auto conserva la firma DMG C=0x13");
+    g_model_pref = SYS_GB_SGB;   // los paquetes solo se decodifican en modo SGB
 
     // MLT_REQ (2 jugadores) => P1 devuelve IDs $xF, $xE al deseleccionar.
     b.ioWrite(0xFF00, 0x30); b.ioWrite(0xFF00, 0x00);
@@ -80,9 +83,81 @@ int main() {
     check(id1 == 0x0F, "MLT_REQ: primer joypad devuelve ID 0x0F");
     check(id2 == 0x0E, "MLT_REQ: segundo joypad devuelve ID 0x0E");
 
+    // --- Colorizacion SGB: PAL01 y color por pixel --------------------------
+    {
+        uint8_t pal01[16] = {0};
+        pal01[0] = 0x00;                       // $00 PAL01
+        pal01[1] = 0xFF; pal01[2] = 0x7F;      // color 0 = blanco
+        pal01[3] = 0x1F; pal01[4] = 0x00;      // pal 0 color 1 = rojo
+        pal01[5] = 0xE0; pal01[6] = 0x03;      // pal 0 color 2 = verde
+        pal01[7] = 0x00; pal01[8] = 0x7C;      // pal 0 color 3 = azul
+        pal01[9] = 0xFF; pal01[10] = 0x03;     // pal 1 color 1 = amarillo
+        sgbSendPacket(b, pal01);
+        check(b.sgbColorActive, "PAL01 activa la colorizacion SGB");
+        check(b.sgbColorPal[0] == 0x7FFF && b.sgbColorPal[1] == 0x001F,
+              "PAL01 carga los colores 0 y 1 de la paleta 0");
+        check(b.sgbColorPal[4] == 0x7FFF && b.sgbColorPal[5] == 0x03FF,
+              "PAL01 carga la paleta 1 y comparte el color 0");
+        b.sgbAttrMap.fill(0);
+        check(b.dmgPixel(0, 0, 1) == 0xF80000u, "dmgPixel aplica el color SGB (tono 1 = rojo)");
+        b.sgbAttrMap[0] = 1;
+        check(b.dmgPixel(0, 0, 1) == 0xF8F800u, "dmgPixel usa la paleta del mapa de atributos");
+        b.sgbAttrMap[0] = 0;
+    }
+
+    // --- ATTR_SET reparte 4 paletas por byte --------------------------------
+    {
+        b.sgbAttrFiles.fill(0);
+        b.sgbAttrFiles[0] = 0xE4;              // tiles 0..3 = 3,2,1,0
+        uint8_t attr[16] = {0}; attr[0] = 0xB0;   // $16 ATTR_SET, fichero 0
+        sgbSendPacket(b, attr);
+        check(b.sgbAttrMap[0] == 3 && b.sgbAttrMap[1] == 2 &&
+              b.sgbAttrMap[2] == 1 && b.sgbAttrMap[3] == 0,
+              "ATTR_SET reparte 4 paletas por byte");
+    }
+
+    // --- ATTR_BLK pinta un rectangulo ---------------------------------------
+    {
+        b.sgbAttrMap.fill(0);
+        uint8_t blk[16] = {0};
+        blk[0] = 0x20;             // $04 ATTR_BLK
+        blk[1] = 1;                // 1 bloque
+        blk[2] = 0x01;             // control: interior
+        blk[3] = 0x02;             // paleta interior = 2
+        blk[4] = 1; blk[5] = 1; blk[6] = 3; blk[7] = 3;   // de (1,1) a (3,3)
+        sgbSendPacket(b, blk);
+        check(b.sgbAttrMap[1 + 20 * 1] == 2 && b.sgbAttrMap[2 + 20 * 2] == 2,
+              "ATTR_BLK asigna la paleta interior");
+        check(b.sgbAttrMap[0] == 0, "ATTR_BLK deja intacto el exterior");
+    }
+
+    // --- PAL_SET copia una paleta del area de paletas -----------------------
+    {
+        uint16_t cols[4] = {0x7FFF, 0x001F, 0x03E0, 0x7C00};
+        for (int c = 0; c < 4; ++c) {
+            b.sgbRamPal[5 * 8 + c * 2] = (uint8_t)(cols[c] & 0xFF);
+            b.sgbRamPal[5 * 8 + c * 2 + 1] = (uint8_t)(cols[c] >> 8);
+        }
+        uint8_t pset[16] = {0}; pset[0] = 0x51; pset[1] = 5;   // $0A PAL_SET, paleta 5
+        sgbSendPacket(b, pset);
+        check(b.sgbColorPal[1] == 0x001F && b.sgbColorPal[3] == 0x7C00,
+              "PAL_SET copia la paleta elegida");
+    }
+
+    // --- PAL_TRN captura la pantalla (plano 0 del tile 0) --------------------
+    {
+        b.sgbShadeBuf.fill(0);
+        for (int x = 0; x < 8; ++x) b.sgbShadeBuf[x] = 1;   // tono 1 en la fila 0
+        b.sgbXferKind = 1; b.sgbXferCount = 1;
+        b.sgbFrameTick();
+        check(b.sgbRamPal[0] == 0xFF && b.sgbRamPal[1] == 0x00,
+              "PAL_TRN captura el plano 0 de la pantalla");
+    }
+
     // --- reset() limpia el estado SGB ---------------------------------------
     b.reset();
-    check(!b.sgbBorderFromPacket && !b.sgbHasTiles, "reset limpia el estado SGB");
+    check(!b.sgbBorderFromPacket && !b.sgbHasTiles && !b.sgbColorActive &&
+          b.sgbColorPal[0] == 0x7FFF, "reset limpia el estado SGB");
 
     // --- Multiplicador de velocidad de audio (waveOutSetPlaybackRate) --------
     // 1.0 = 0x10000; 4x = 0x40000. No son Hz.

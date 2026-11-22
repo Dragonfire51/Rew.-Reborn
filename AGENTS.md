@@ -47,6 +47,26 @@ Compiling just the source (`-c`) is a fast syntax check.
 - Keep `resource.rc` line endings as CRLF.
 
 ## Features (v1.1)
+- v1.1.3 adds Super Game Boy colorization. The SGB does not read palettes or
+  attributes from VRAM: it captures them from the video signal. `PAL_TRN`
+  (`$0B`) and `ATTR_TRN` (`$15`) set `sgbXferKind` and a 3-frame countdown
+  (`sgbXferCount`); at VBlank (`ppuDot`, `ly == 144`) `sgbFrameTick()` turns the
+  last rendered frame (`sgbShadeBuf`, the raw 0-3 tone per pixel, filled by
+  `dmgPixel`) into 16-byte tiles and stores 4096 bytes in `sgbRamPal` or 4050 in
+  `sgbAttrFiles`. `PAL_SET` (`$0A`) copies four 4-color palettes from
+  `sgbRamPal` into `sgbColorPal` (color 0 is shared by all four); `PAL01/PAL23/
+  PAL03/PAL12` (`$00-$03`) set the colors directly (`sgbPalCommand`);
+  `ATTR_SET` (`$16`) expands one of the 45 attribute files into `sgbAttrMap`
+  (4 tiles per byte, 2 bits each); `ATTR_BLK/LIN/DIV/CHR` (`$04-$07`) write the
+  map directly. Rendering: `dmgPixel()` maps the post-BGP/OBP tone (0-3) through
+  `sgbColorPal[4 * (sgbAttrMap[tile] & 3) + tone]`, so sprites and BG share the
+  tile's palette (SameBoy semantics). `sgbColorActive` is only set by these
+  packets, so DMG/CGB games keep their normal palettes. The ICD2 P1 decoder is
+  now gated to SGB modes (`!isCgbMode && !gbsPlayerMode && (sgbSignatureMode ||
+  ModeUsesBorder(...))`), so joypad writes are no longer decoded as packets in
+  DMG/CGB. Verified against SameBoy 1.0.5: Medarot's `PAL_TRN` captures
+  `7FFF 273F 10F8 0000` (white/orange/red/black) and the title screen matches.
+  Save-state version is 11.
 - v1.1.2 fixes two player/rendering bugs:
   - GBS files larger than the free space below 0x8000 now load: `GbsBuildRom`
     sizes the synthetic ROM to `load + payload` (power of two, up to 4 MiB) and

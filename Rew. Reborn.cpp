@@ -149,7 +149,7 @@ bool g_sgb_capture_pending = false;
 uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
 int  g_sgb_captured_count = 0;
 char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
-char g_window_base_title[MAX_PATH] = "Rew. Reborn v1.1.2";
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v1.1.3";
 // Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
 // modo que el sonido conserva su tono mientras la emulacion acelera. Si el
 // dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
@@ -1844,7 +1844,7 @@ bool g_link_enabled = false;
 class Bus {
 public:
     static constexpr uint32_t kStateMagic = 0x52455742; // "REWB"
-    static constexpr uint32_t kStateVersion = 10;
+    static constexpr uint32_t kStateVersion = 11;
 
     // ------------------------------------------------------------ cartucho
     std::vector<uint8_t> rom;
@@ -1934,6 +1934,17 @@ public:
     std::array<uint8_t, 0x800> sgbMapData{};    // tilemap 32x28 + fila extra
     std::array<uint16_t, 64> sgbPalData{};      // paletas 0-3, RGB555
     bool sgbHasTiles = false, sgbHasMap = false;
+    // Colorizacion SGB (PAL_TRN/PAL_SET/ATTR_*): el SGB captura los datos de
+    // paletas y atributos de la senal de video (no de VRAM) y los aplica al
+    // area de juego: tono 0-3 -> color de la paleta del tile.
+    std::array<uint16_t, 16> sgbColorPal{};      // 4 paletas x 4 colores RGB555
+    std::array<uint8_t, 20 * 18> sgbAttrMap{};   // paleta (0-3) por tile 8x8
+    std::array<uint8_t, 4096> sgbRamPal{};       // area de paletas (512 x 8 bytes)
+    std::array<uint8_t, 45 * 90> sgbAttrFiles{}; // ficheros de atributos integrados
+    std::array<uint8_t, GB_WIDTH * GB_HEIGHT> sgbShadeBuf{};  // ultimo frame en tonos 0-3
+    int sgbXferKind = 0;    // 1 = PAL_TRN, 2 = ATTR_TRN (captura diferida 3 frames)
+    int sgbXferCount = 0;
+    bool sgbColorActive = false;   // el juego ya envio paletas/atributos SGB
     // Borde decodificado (256x224, RGB888).
     uint32_t sgbDecodedBorder[SGB_W * SGB_H] = {0};
     bool sgbBorderFromPacket = false;
@@ -1977,6 +1988,55 @@ public:
         sgbRebuildBorderInto(sgbDecodedBorder);
         sgbBorderFromPacket = true;
     }
+    // ---------------------------------------------------- colorizacion SGB
+    // Convierte el ultimo frame renderizado a datos de tile (16 bytes/tile),
+    // que es lo que el SGB captura de la salida de video en *_TRN.
+    void sgbCaptureTiles(uint8_t* out) const {
+        for (int t = 0; t < 256; ++t) {
+            int tx = (t % 20) * 8, ty = (t / 20) * 8;
+            for (int y = 0; y < 8; ++y) {
+                uint8_t lo = 0, hi = 0;
+                for (int x = 0; x < 8; ++x) {
+                    uint8_t idx = sgbShadeBuf[(ty + y) * GB_WIDTH + tx + x] & 3;
+                    if (idx & 1) lo |= (uint8_t)(1u << (7 - x));
+                    if (idx & 2) hi |= (uint8_t)(1u << (7 - x));
+                }
+                out[t * 16 + y * 2] = lo;
+                out[t * 16 + y * 2 + 1] = hi;
+            }
+        }
+    }
+    // PAL01/PAL23/PAL03/PAL12: color 0 compartido + 3 colores de dos paletas.
+    void sgbPalCommand(int first, int second) {
+        uint16_t c0 = (uint16_t)(sgbPacket[1] | (sgbPacket[2] << 8));
+        for (int i = 0; i < 4; ++i) sgbColorPal[i * 4] = c0;
+        for (int i = 0; i < 3; ++i) {
+            sgbColorPal[first * 4 + i + 1] = (uint16_t)(sgbPacket[3 + i * 2] | (sgbPacket[4 + i * 2] << 8));
+            sgbColorPal[second * 4 + i + 1] = (uint16_t)(sgbPacket[9 + i * 2] | (sgbPacket[10 + i * 2] << 8));
+        }
+        sgbColorActive = true;
+    }
+    // ATTR_SET: carga un fichero de atributos integrado (4 tiles por byte).
+    void sgbLoadAttrFile(int file) {
+        if (file > 0x2C) return;
+        const uint8_t* src = &sgbAttrFiles[file * 90];
+        int o = 0;
+        for (int i = 0; i < 90; ++i) {
+            uint8_t v = src[i];
+            for (int j = 0; j < 4; ++j) { sgbAttrMap[o++] = (uint8_t)(v >> 6); v <<= 2; }
+        }
+        sgbColorActive = true;
+    }
+    // Transferencias PAL_TRN/ATTR_TRN: el SGB lee la pantalla 3 frames despues.
+    void sgbFrameTick() {
+        if (sgbXferCount > 0 && --sgbXferCount == 0) {
+            uint8_t buf[256 * 16];
+            sgbCaptureTiles(buf);
+            if (sgbXferKind == 1) memcpy(sgbRamPal.data(), buf, sgbRamPal.size());
+            else if (sgbXferKind == 2) memcpy(sgbAttrFiles.data(), buf, sgbAttrFiles.size());
+            sgbXferKind = 0;
+        }
+    }
     // Firma SGB en el registro C tras el arranque: C=0x14 (SGB/SGB2), C=0x00
     // (CGB), C=0x13 (DMG normal). Solo se expone cuando la peticion de modo la
     // activa, de modo que la firma "por defecto" de cada hardware se conserva.
@@ -2010,6 +2070,94 @@ public:
                     sgbPalData[i] = (uint16_t)(vram[0x1000 + i * 2] | (vram[0x1000 + i * 2 + 1] << 8));
                 sgbHasMap = true;
                 break;
+            }
+            case 0x00: sgbPalCommand(0, 1); return;   // PAL01
+            case 0x01: sgbPalCommand(2, 3); return;   // PAL23
+            case 0x02: sgbPalCommand(0, 3); return;   // PAL03
+            case 0x03: sgbPalCommand(1, 2); return;   // PAL12
+            case 0x0A: {  // PAL_SET: selecciona paletas del area de paletas
+                for (int i = 0; i < 4; ++i) {
+                    int idx = (p[1 + i * 2] + ((p[2 + i * 2] & 1) << 8)) * 8;
+                    for (int c = 0; c < 4; ++c)
+                        sgbColorPal[i * 4 + c] = (uint16_t)(sgbRamPal[idx + c * 2] |
+                                                            (sgbRamPal[idx + c * 2 + 1] << 8));
+                    sgbColorPal[i * 4] = sgbColorPal[0];   // color 0 compartido
+                }
+                sgbColorActive = true;
+                return;
+            }
+            case 0x0B: sgbXferKind = 1; sgbXferCount = 3; return;  // PAL_TRN
+            case 0x15: sgbXferKind = 2; sgbXferCount = 3; return;  // ATTR_TRN
+            case 0x16: sgbLoadAttrFile(p[1] & 0x3F); return;       // ATTR_SET
+            case 0x04: {  // ATTR_BLK: rectangulos con paleta interior/borde/exterior
+                int n = p[1] > 0x12 ? 0x12 : p[1];
+                for (int i = 0; i < n && 2 + i * 6 + 5 < 16; ++i) {
+                    const uint8_t* d = p + 2 + i * 6;
+                    bool inside = d[0] & 1, middle = d[0] & 2, outside = d[0] & 4;
+                    int pin = d[1] & 3, pmid = (d[1] >> 2) & 3, pout = (d[1] >> 4) & 3;
+                    if (inside && !middle && !outside) { middle = true; pmid = pin; }
+                    else if (outside && !middle && !inside) { middle = true; pmid = pout; }
+                    int left = d[2] & 0x1F, top = d[3] & 0x1F;
+                    int right = d[4] & 0x1F, bottom = d[5] & 0x1F;
+                    for (int y = 0; y < 18; ++y)
+                        for (int x = 0; x < 20; ++x) {
+                            if (x < left || x > right || y < top || y > bottom) {
+                                if (outside) sgbAttrMap[x + 20 * y] = (uint8_t)pout;
+                            } else if (x > left && x < right && y > top && y < bottom) {
+                                if (inside) sgbAttrMap[x + 20 * y] = (uint8_t)pin;
+                            } else if (middle) {
+                                sgbAttrMap[x + 20 * y] = (uint8_t)pmid;
+                            }
+                        }
+                }
+                sgbColorActive = true;
+                return;
+            }
+            case 0x05: {  // ATTR_LIN: lineas completas
+                int n = p[1];
+                for (int i = 0; i < n && 2 + i < 16; ++i) {
+                    uint8_t d = p[2 + i];
+                    bool horizontal = d & 0x80;
+                    int pal = (d >> 5) & 3, line = d & 0x1F;
+                    if (horizontal) {
+                        if (line > 17) continue;
+                        for (int x = 0; x < 20; ++x) sgbAttrMap[x + 20 * line] = (uint8_t)pal;
+                    } else {
+                        if (line > 19) continue;
+                        for (int y = 0; y < 18; ++y) sgbAttrMap[line + 20 * y] = (uint8_t)pal;
+                    }
+                }
+                sgbColorActive = true;
+                return;
+            }
+            case 0x06: {  // ATTR_DIV: divide la pantalla en dos zonas + linea
+                int high = p[1] & 3, low = (p[1] >> 2) & 3, mid = (p[1] >> 4) & 3;
+                bool horizontal = p[1] & 0x40;
+                int line = p[2] & 0x1F;
+                for (int y = 0; y < 18; ++y)
+                    for (int x = 0; x < 20; ++x) {
+                        int v = horizontal ? y : x;
+                        sgbAttrMap[x + 20 * y] = (uint8_t)(v < line ? low : (v == line ? mid : high));
+                    }
+                sgbColorActive = true;
+                return;
+            }
+            case 0x07: {  // ATTR_CHR: cadena de tiles
+                int x = p[1], y = p[2];
+                if (x >= 20 || y >= 18) return;
+                int count = p[3] | (p[4] << 8);
+                bool vertical = p[5] & 1;
+                for (int i = 0; i < count && 6 + i / 4 < 16; ++i) {
+                    int pal = (p[6 + i / 4] >> (((~i) & 3) << 1)) & 3;
+                    sgbAttrMap[x + 20 * y] = (uint8_t)pal;
+                    if (vertical) {
+                        if (++y == 18) { y = 0; if (++x == 20) break; }
+                    } else {
+                        if (++x == 20) { x = 0; if (++y == 18) break; }
+                    }
+                }
+                sgbColorActive = true;
+                return;
             }
             default: break;
         }
@@ -2163,6 +2311,9 @@ public:
         sgbMultiPlayer = false; sgbPlayerCount = 2; sgbPlayerIndex = 0;
         sgbHasTiles = sgbHasMap = false; sgbBorderFromPacket = false;
         sgbTileData.fill(0); sgbMapData.fill(0); sgbPalData.fill(0);
+        sgbColorPal.fill(0x7FFF); sgbAttrMap.fill(0); sgbRamPal.fill(0);
+        sgbAttrFiles.fill(0); sgbShadeBuf.fill(0);
+        sgbXferKind = 0; sgbXferCount = 0; sgbColorActive = false;
         memset(sgbDecodedBorder, 0, sizeof(sgbDecodedBorder));
         sb = 0; sc = 0x7E; serialCycles = 0; serialOut.clear();
         vram.fill(0); vram1.fill(0); wram.fill(0); oam.fill(0); hram.fill(0);
@@ -2599,6 +2750,9 @@ public:
                 ppuMode = 1;
                 iflag |= 0x01;
                 memcpy(g_screenBuffer, frameBuf, sizeof(frameBuf));
+                // El SGB captura paletas/atributos de esta imagen (3 frames
+                // despues del paquete) y colorea el area de juego.
+                sgbFrameTick();
                 frameReady = true;
             }
         }
@@ -2639,6 +2793,13 @@ public:
         }
     }
 
+    // Color de un pixel DMG: tono 0-3 -> color de la paleta SGB del tile.
+    uint32_t dmgPixel(int x, int y, uint8_t idx) {
+        sgbShadeBuf[y * GB_WIDTH + x] = idx & 3;
+        if (!sgbColorActive || isCgbMode) return dmgShade(idx);
+        int pal = sgbAttrMap[(x >> 3) + (y >> 3) * 20] & 3;
+        return sgbRgb555to888(sgbColorPal[pal * 4 + (idx & 3)]);
+    }
     void renderScanline() {
         uint8_t bgIdx[GB_WIDTH];
         uint8_t bgAttrPrio[GB_WIDTH];
@@ -2650,7 +2811,7 @@ public:
         int winX = (int)wx - 7;
         for (int x = 0; x < GB_WIDTH; ++x) {
             bgIdx[x] = 0; bgAttrPrio[x] = 0;
-            if (!bgOn) { row[x] = dmgShade(bgp & 3); continue; }
+            if (!bgOn) { row[x] = dmgPixel(x, ly, bgp & 3); continue; }
             bool inWin = winOn && x >= winX;
             int px, py; uint16_t mapBase;
             if (inWin) {
@@ -2679,7 +2840,7 @@ public:
                 int pi = (attr & 7) * 8 + ci * 2;
                 row[x] = rgb555ToArgb((uint16_t)(bgPaletteRam[pi] | (bgPaletteRam[pi + 1] << 8)));
             } else {
-                row[x] = dmgShade((bgp >> (ci * 2)) & 3);
+                row[x] = dmgPixel(x, ly, (bgp >> (ci * 2)) & 3);
             }
         }
         if (winUsed) windowInternalLine++;
@@ -2720,7 +2881,7 @@ public:
                     row[x] = rgb555ToArgb((uint16_t)(objPaletteRam[pi] | (objPaletteRam[pi + 1] << 8)));
                 } else {
                     uint8_t pal = (fl & 0x10) ? obp1 : obp0;
-                    row[x] = dmgShade((pal >> (ci * 2)) & 3);
+                    row[x] = dmgPixel(x, ly, (pal >> (ci * 2)) & 3);
                 }
             }
         }
@@ -2818,7 +2979,11 @@ public:
 #ifdef REW_SGB_TEST_HOOKS
                 { extern void sgbRawLog(uint8_t); sgbRawLog(v); }
 #endif
-                sgbWriteP1(v);
+                // El protocolo SGB (ICD2) solo existe en hardware SGB; en los
+                // demas modos las escrituras de joypad no deben decodificarse
+                // como paquetes.
+                if (!isCgbMode && !gbsPlayerMode && (sgbSignatureMode || ModeUsesBorder(g_model_pref)))
+                    sgbWriteP1(v);
                 return;
             }
             case 0xFF01: sb = v; return;
@@ -3250,6 +3415,8 @@ public:
         io(sgbMultiPlayer); io(sgbPlayerCount); io(sgbPlayerIndex);
         io(sgbPacket); io(sgbTileData); io(sgbMapData); io(sgbPalData);
         io(sgbHasTiles); io(sgbHasMap); io(sgbBorderFromPacket); io(sgbDecodedBorder);
+        io(sgbColorPal); io(sgbAttrMap); io(sgbRamPal); io(sgbAttrFiles);
+        io(sgbShadeBuf); io(sgbXferKind); io(sgbXferCount); io(sgbColorActive);
         io(lcdc); io(stat); io(scy); io(scx); io(ly); io(lyReg); io(lyc); io(wy); io(wx);
         io(bgp); io(obp0); io(obp1); io(lineDot); io(mode3End); io(ppuMode); io(statLine);
         io(lcdFirstLine); io(wyTriggered); io(windowInternalLine); io(frameBuf);
@@ -5084,8 +5251,20 @@ INT_PTR CALLBACK AboutProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
 
 void MostrarAcercaDe(HWND hWnd) {
     g_about_text =
-        "Rew. Reborn v1.1.2\n"
+        "Rew. Reborn v1.1.3\n"
         "Emulador Game Boy / Game Boy Color\n\n"
+        "Novedades v1.1.3:\n"
+        "- Colorizacion Super Game Boy: se aplican las paletas\n"
+        "  y el mapa de atributos que envia el juego (PAL01/23/\n"
+        "  03/12, PAL_SET, PAL_TRN, ATTR_BLK/LIN/DIV/CHR,\n"
+        "  ATTR_TRN y ATTR_SET), capturados de la imagen como en\n"
+        "  el SGB real (3 frames despues del paquete)\n"
+        "- Medarot Card Robottle ya se ve en color en los modos\n"
+        "  Super Game Boy, Game Boy + SGB Border y Game Boy\n"
+        "  Color + SGB Border\n"
+        "- El protocolo SGB solo se decodifica en los modos SGB\n"
+        "  (en DMG/CGB las escrituras de joypad ya no se\n"
+        "  interpretan como paquetes)\n\n"
         "Novedades v1.1.2:\n"
         "- Reproductor GBS: los archivos que no caben en 32 KiB\n"
         "  ya se cargan con el mapper GBS (banco conmutable por\n"
