@@ -47,6 +47,22 @@ Compiling just the source (`-c`) is a fast syntax check.
 - Keep `resource.rc` line endings as CRLF.
 
 ## Features (v1.1)
+- v1.1.2 fixes two player/rendering bugs:
+  - GBS files larger than the free space below 0x8000 now load: `GbsBuildRom`
+    sizes the synthetic ROM to `load + payload` (power of two, up to 4 MiB) and
+    `loadRomFromData(..., gbsMapper=true)` installs mapper 6, the GBS mapper
+    (write to 0x2000-0x3FFF selects the 16 KiB bank at 0x4000, `val 0 -> 1`,
+    8 KiB RAM at 0xA000). `play` is now driven like gbsplay: VBlank handler
+    (`IE` bit 0) when the GBS has no timer, the timer vector when `TAC & 4`, and
+    the ugetab variant (`TAC & 0x78 == 0x40`) calls the rip's handler at
+    `load+0x40`/`load+0x48` first. `TMA`/`TAC` are set before `init`.
+  - Medarot Card Robottle (CGB flag 0x80, SGB flag 0x03) was white in the
+    CGB+SGB modes: it never writes CGB palettes. `CartTocaPaletasCgb()` runs a
+    throwaway copy for up to 180 frames checking `Bus::cgbPaletteTouched`
+    (set on writes to FF68-FF6B); if untouched, the ROM loads with
+    `forceDmg=true`, so it runs as DMG+SGB. `gbsPlayerMode` replaced
+    `forceDmgMode` and is the only thing that suppresses the SGB signature
+    (`C=0x14`), so a forced-DMG cart still gets it.
 - v1.1.1 turns the About box into a scrollable dialog (`IDD_ABOUT`) and keeps
   the full changelog readable on any screen size.
 - v1.1.0 adds a GBS/NSF music player. `.gbs` and `.nsf` files are opened from

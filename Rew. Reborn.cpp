@@ -149,7 +149,7 @@ bool g_sgb_capture_pending = false;
 uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
 int  g_sgb_captured_count = 0;
 char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
-char g_window_base_title[MAX_PATH] = "Rew. Reborn v1.1.1";
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v1.1.2";
 // Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
 // modo que el sonido conserva su tono mientras la emulacion acelera. Si el
 // dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
@@ -1618,33 +1618,60 @@ static bool GbsParse(const std::vector<uint8_t>& d, GbsInfo& info) {
     return true;
 }
 
-// Construye un ROM de 32 KiB: stub en 0x150, handler del timer en 0x190 y los
-// datos del GBS en loadAddr (>= 0x200 para no pisar el stub).
+// Construye un ROM con el stub en 0x150, los vectores de interrupcion en
+// 0x40/0x50 y los datos del GBS en loadAddr (>= 0x200 para no pisar el stub).
+// Si el GBS no cabe en 32 KiB se genera un ROM mayor y se usa el mapper GBS
+// (escritura en 0x2000-0x3FFF selecciona el banco de 0x4000), igual que gbsplay.
 static bool GbsBuildRom(const std::vector<uint8_t>& gbs, int track, std::vector<uint8_t>& out) {
     GbsInfo info;
     if (!GbsParse(gbs, info)) return false;
     size_t dataLen = gbs.size() - 0x70;
-    if (info.loadAddr < 0x200 || info.loadAddr + dataLen > 0x8000) return false;
-    out.assign(0x8000, 0xFF);
+    if (info.loadAddr < 0x200) return false;
+    size_t need = (size_t)info.loadAddr + dataLen;
+    size_t romSize = 0x8000;
+    while (romSize < need) romSize <<= 1;
+    if (romSize > 0x400000) return false;
+    out.assign(romSize, 0xFF);
     memcpy(out.data() + info.loadAddr, gbs.data() + 0x70, dataLen);
 
     // Cabecera de cartucho DMG (sin boot ROM, no hace falta el logo).
     memset(out.data() + 0x104, 0, 0x40);
     memcpy(out.data() + 0x134, "GBS PLAYER", 10);
     out[0x143] = 0x00;   // DMG
-    out[0x147] = 0x00;   // ROM only
-    out[0x148] = 0x00;   // 32 KiB
-    out[0x149] = 0x00;   // sin RAM
+    out[0x146] = 0x00;   // sin SGB
+    out[0x147] = 0x00;   // ROM only (el mapper GBS lo aplica el emulador)
+    out[0x148] = 0x00;   // tamano en potencias de 2: 0=32K, 1=64K...
+    out[0x149] = 0x02;   // 8 KiB de RAM (el mapper GBS la expone en 0xA000)
+    for (size_t s2 = romSize; s2 > 0x8000; s2 >>= 1) out[0x148]++;
 
-    // Vectores de interrupcion.
-    out[0x40] = 0xD9;    // VBlank: RETI
-    out[0x48] = 0xD9;    // STAT: RETI
-    out[0x50] = 0xD9;    // Timer: RETI (se cambia si hay play)
-    out[0x58] = 0xD9;    // Serial: RETI
-    out[0x60] = 0xD9;    // Joypad: RETI
+    // Vectores de interrupcion, con el mismo criterio que gbsplay:
+    //  - tac con 0x40 (ugetab): el handler del rip esta en load+0x40/0x48 y
+    //    play se llama desde VBlank.
+    //  - timer activo: play se llama desde la interrupcion del timer.
+    //  - sin timer: play se llama desde VBlank (59.7 Hz).
+    out[0x40] = out[0x48] = out[0x50] = out[0x58] = out[0x60] = 0xD9;
+    auto putCall = [&](uint16_t at, uint16_t target) {
+        out[at] = 0xCD;
+        out[at + 1] = (uint8_t)(target & 0xFF);
+        out[at + 2] = (uint8_t)(target >> 8);
+    };
+    if (info.playAddr) {
+        if ((info.timerControl & 0x78) == 0x40) {
+            putCall(0x40, (uint16_t)(info.loadAddr + 0x40));
+            putCall(0x43, info.playAddr);
+            out[0x46] = 0xD9;
+            putCall(0x50, (uint16_t)(info.loadAddr + 0x48));
+            out[0x53] = 0xD9;
+        } else if (info.timerControl & 0x04) {
+            putCall(0x50, info.playAddr);
+            out[0x53] = 0xD9;
+        } else {
+            putCall(0x40, info.playAddr);
+            out[0x43] = 0xD9;
+        }
+    }
 
     const uint16_t stub = 0x150;
-    const uint16_t handler = 0x190;
     out[0x100] = 0xC3;
     out[0x101] = (uint8_t)(stub & 0xFF);
     out[0x102] = (uint8_t)(stub >> 8);
@@ -1655,10 +1682,13 @@ static bool GbsBuildRom(const std::vector<uint8_t>& gbs, int track, std::vector<
     put(0x31); put((uint8_t)(info.stackPtr & 0xFF)); put((uint8_t)(info.stackPtr >> 8));
     put(0x01); put(0x00); put(0x00);               // LD BC,0
     put(0x11); put(0x00); put(0x00);               // LD DE,0
-    put(0x21); put(0x00); put(0x00);               // LD HL,0
+    put(0x21); put(0x00); put(0x20);               // LD HL,0x2000
+    put(0x36); put(0x00);                          // LD (HL),0 -> banco 1 (mapper GBS)
     put(0x3E); put(0x80); put(0xE0); put(0x26);    // NR52 on
     put(0x3E); put(0xFF); put(0xE0); put(0x25);    // NR51
     put(0x3E); put(0x77); put(0xE0); put(0x24);    // NR50
+    put(0x3E); put(info.timerModulo); put(0xE0); put(0x06);  // TMA (antes de init)
+    put(0x3E); put(info.timerControl); put(0xE0); put(0x07); // TAC (antes de init)
     if (info.initAddr) {
         put(0x3E); put((uint8_t)track);            // LD A,track
         put(0xCD); put((uint8_t)(info.initAddr & 0xFF)); put((uint8_t)(info.initAddr >> 8));
@@ -1667,28 +1697,10 @@ static bool GbsBuildRom(const std::vector<uint8_t>& gbs, int track, std::vector<
     put(0x3E); put(0x80); put(0xE0); put(0x26);
     put(0x3E); put(0xFF); put(0xE0); put(0x25);
     put(0x3E); put(0x77); put(0xE0); put(0x24);
-
-    if (info.playAddr) {
-        uint8_t tma = info.timerControl ? info.timerModulo : 188;
-        uint8_t tac = info.timerControl ? (uint8_t)(info.timerControl | 0x04) : 0x04;
-        put(0x3E); put(tma); put(0xE0); put(0x06); // TMA
-        put(0x3E); put(tac); put(0xE0); put(0x07); // TAC
-        put(0x3E); put(0x04); put(0xE0); put(0xFF); // IE = timer
-        // Vector del timer: JP handler.
-        out[0x50] = 0xC3;
-        out[0x51] = (uint8_t)(handler & 0xFF);
-        out[0x52] = (uint8_t)(handler >> 8);
-        // handler: PUSH AF/BC/DE/HL; CALL play; POP HL/DE/BC/AF; RETI
-        uint16_t q = handler;
-        auto hput = [&](uint8_t b) { out[q++] = b; };
-        hput(0xF5); hput(0xC5); hput(0xD5); hput(0xE5);
-        hput(0xCD); hput((uint8_t)(info.playAddr & 0xFF)); hput((uint8_t)(info.playAddr >> 8));
-        hput(0xE1); hput(0xD1); hput(0xC1); hput(0xF1);
-        hput(0xD9);
-    }
-    put(0xFB);                                      // EI
-    put(0x76);                                      // HALT
-    put(0x18); put(0xFD);                           // JR -3
+    put(0x3E); put(0x05); put(0xE0); put(0xFF);    // IE = VBlank + Timer
+    put(0xFB);                                     // EI
+    put(0x76);                                     // HALT
+    put(0x18); put(0xFD);                          // JR -3
     return true;
 }
 
@@ -1838,10 +1850,13 @@ public:
     std::vector<uint8_t> rom;
     std::array<uint8_t, 0x20000> ext_ram{};
     bool mbc1Multicart = false;
-    uint8_t mbcType = 0;            // 0 nada, 1 MBC1, 2 MBC2, 3 MBC3, 5 MBC5
+    uint8_t mbcType = 0;            // 0 nada, 1 MBC1, 2 MBC2, 3 MBC3, 5 MBC5, 6 GBS
     bool hasRtc = false, hasBattery = false;
     uint32_t ramSize = 0;
     uint16_t romBank = 1;
+    // Se pone a true en cuanto el juego escribe una paleta CGB (FF68-FF6B);
+    // el reproductor GBS y la deteccion de juegos DMG lo consultan.
+    bool cgbPaletteTouched = false;
     uint8_t ramBank = 0;
     bool ramEnabled = false;
     uint8_t mbcMode = 0;
@@ -1866,9 +1881,9 @@ public:
 
     // ------------------------------------------------------------ CGB
     bool isCgbMode = false;
-    // GBS: el cartucho sintetico debe arrancar siempre como DMG normal, sin la
-    // firma SGB, aunque el usuario tenga seleccionado un modo SGB/CGB.
-    bool forceDmgMode = false;
+    // GBS: el cartucho sintetico arranca como DMG sin la firma SGB aunque el
+    // usuario tenga seleccionado un modo SGB/CGB.
+    bool gbsPlayerMode = false;
     uint8_t vbk = 0, svbk = 0, key1Armed = 0, opri = 0;
     uint8_t ff72 = 0, ff73 = 0, ff74 = 0, ff75 = 0;
     bool cgbDoubleSpeed = false;
@@ -2072,8 +2087,8 @@ public:
 
     // Carga una imagen de cartucho ya en memoria (la usa el reproductor GBS
     // para montar un ROM sintetico con su stub de init/play).
-    bool loadRomFromData(std::vector<uint8_t> data, bool forceDmg) {
-        forceDmgMode = forceDmg;
+    bool loadRomFromData(std::vector<uint8_t> data, bool forceDmg, bool gbsMapper = false) {
+        gbsPlayerMode = gbsMapper;
         if (data.size() < 0x150) return false;
         size_t sz = 0x8000;
         while (sz < data.size()) sz <<= 1;
@@ -2100,6 +2115,9 @@ public:
         ramSize = rs < 6 ? kRamSizes[rs] : 0;
         if (mbcType == 2) ramSize = 0x200;
         if (type == 0x10 || type == 0x13 || type == 0x12) { if (ramSize == 0) ramSize = 0x8000; }
+        // Mapper GBS (reproductor de musica): banco de 0x4000 conmutable por
+        // escritura en 0x2000-0x3FFF y 8 KiB de RAM siempre accesibles.
+        if (gbsMapper) { mbcType = 6; ramSize = 0x2000; }
 
         mbc1Multicart = mbcType == 1 && rom.size() == 0x100000 &&
                         std::equal(rom.begin() + 0x104, rom.begin() + 0x134, rom.begin() + 0x40104);
@@ -2131,12 +2149,13 @@ public:
         // DMG+SGB la exponen siempre; en los modos CGB+SGB la partida CGB
         // conserva C=0x00, pero un cartucho DMG corre como DMG+SGB y tambien la
         // recibe (igual que durante la captura del borde).
-        if (!forceDmgMode && (sgbSignatureMode || (!isCgbMode && ModeUsesBorder(g_model_pref)))) c = 0x14;
+        if (sgbSignatureMode || (!isCgbMode && ModeUsesBorder(g_model_pref) && !gbsPlayerMode)) c = 0x14;
         pc = 0x100; sp = 0xFFFE;
         ime = imeEnablePending = halted = haltBugPending = false;
         divCounter = isCgbMode ? 0x1EA0 : 0xABCC;
         tima = 0; tma = 0; tac = 0xF8; timaState = 0;
-        romBank = 1; ramBank = 0; ramEnabled = (mbcType == 0); mbcMode = 0;
+        romBank = 1; ramBank = 0; ramEnabled = (mbcType == 0 || mbcType == 6); mbcMode = 0;
+        cgbPaletteTouched = false;
         rtcLatchPrev = 0xFF; rtcBase = rtcNow();
         dmaActive = false; dmaIndex = 0; dmaReg = 0xFF; dmaSrc = 0; dmaPendingSrc = 0; dmaStartDelay = 0;
         joypSelect = 0x30; buttonsState = 0xFF;
@@ -2207,6 +2226,9 @@ public:
                     if (rtcLatchPrev == 0x00 && v == 0x01) rtcLatch();
                     rtcLatchPrev = v;
                 }
+                break;
+            case 6:  // GBS: banco de 0x4000-0x7FFF por escritura en 0x2000-0x3FFF
+                if (addr >= 0x2000 && addr < 0x4000) { romBank = v ? v : 1; }
                 break;
             case 5:
                 if (addr < 0x2000) ramEnabled = (v & 0x0F) == 0x0A;
@@ -2855,13 +2877,15 @@ public:
             case 0xFF53: hdmaDst = (uint16_t)((hdmaDst & 0x00F0) | ((v & 0x1F) << 8)); return;
             case 0xFF54: hdmaDst = (uint16_t)((hdmaDst & 0x1F00) | (v & 0xF0)); return;
             case 0xFF55: writeHdma5(v); return;
-            case 0xFF68: bcps = v & 0xBF; return;
+            case 0xFF68: bcps = v & 0xBF; cgbPaletteTouched = true; return;
             case 0xFF69:
+                cgbPaletteTouched = true;
                 if (!vramBlocked()) bgPaletteRam[bcps & 0x3F] = v;
                 if (bcps & 0x80) bcps = (uint8_t)(0x80 | ((bcps + 1) & 0x3F));
                 return;
-            case 0xFF6A: ocps = v & 0xBF; return;
+            case 0xFF6A: ocps = v & 0xBF; cgbPaletteTouched = true; return;
             case 0xFF6B:
+                cgbPaletteTouched = true;
                 if (!vramBlocked()) objPaletteRam[ocps & 0x3F] = v;
                 if (ocps & 0x80) ocps = (uint8_t)(0x80 | ((ocps + 1) & 0x3F));
                 return;
@@ -3969,8 +3993,11 @@ bool CapturarBordeSgbParaCgb() {
 void PrepararBordeParaModo(int mode) {
     g_sgb_captured_count = 0;
     g_sgb_capture_pending = false;
-    bool cgbCart = !g_bus.rom.empty() && g_bus.rom.size() > 0x143 && (g_bus.rom[0x143] & 0x80);
-    if ((mode == SYS_GBC_SGB || mode == SYS_GBC_INIT_SGB) && (g_bus.rom.empty() || cgbCart)) {
+    // Solo los cartuchos que corren realmente en CGB necesitan que se les
+    // capture el borde desde una copia DMG+SGB; los forzados a DMG lo reciben
+    // ellos mismos por paquetes SGB.
+    bool cgbSession = !g_bus.rom.empty() && g_bus.isCgbMode;
+    if ((mode == SYS_GBC_SGB || mode == SYS_GBC_INIT_SGB) && (g_bus.rom.empty() || cgbSession)) {
         if (!g_bus.rom.empty()) {
             if (!CapturarBordeSgbParaCgb()) g_sgb_capture_pending = true;
         } else {
@@ -4680,7 +4707,7 @@ static bool PlayerStartGbsTrack(int track) {
     if (track > total) track = total;
     std::vector<uint8_t> rom;
     if (!GbsBuildRom(g_player.file, track, rom)) return false;
-    if (!g_bus.loadRomFromData(std::move(rom), true)) return false;
+    if (!g_bus.loadRomFromData(std::move(rom), true, true)) return false;
     g_player.track = track;
     g_player.total = total;
     g_audio_ext_buf = nullptr;
@@ -4826,13 +4853,32 @@ static bool CargarMusicaDesdeRuta(HWND hWnd, const char* szFile, int type) {
     return true;
 }
 
+// [v1.1.2] Ejecuta una copia desechable en modo CGB y mira si el juego llega a
+// tocar las paletas CGB (FF68-FF6B). Muchos cartuchos "GB Compatible" (flag
+// 0x80) con soporte SGB son en realidad juegos DMG que nunca inicializan las
+// paletas CGB: en los modos CGB+SGB se quedan en pantalla blanca (Medarot Card
+// Robottle). Si en 3 s no las ha tocado, se ejecuta como DMG+SGB.
+static bool CartTocaPaletasCgb(const std::vector<uint8_t>& rom) {
+    Bus probe;
+    if (!probe.loadRomFromData(rom, false)) return true;
+    if (!probe.isCgbMode) return true;
+    for (int i = 0; i < 180 && !probe.cgbPaletteTouched; ++i) probe.runFrame();
+    return probe.cgbPaletteTouched;
+}
+
 bool CargarRomDesdeRuta(HWND hWnd, const char* szFile) {
     int musicType = PLAYER_NONE;
     if (EsArchivoMusica(szFile, musicType))
         return CargarMusicaDesdeRuta(hWnd, szFile, musicType);
     if (g_rom_loaded) GuardarSramCartucho();
     PlayerStop();
-    if (!g_bus.loadRom(std::string(szFile))) {
+    std::ifstream fi(szFile, std::ios::binary);
+    std::vector<uint8_t> romData((std::istreambuf_iterator<char>(fi)), std::istreambuf_iterator<char>());
+    bool forceDmgSgb = false;
+    if (romData.size() > 0x150 && ModeForcesCgb(g_model_pref) &&
+        (romData[0x143] & 0x80) && !(romData[0x143] & 0x40) && romData[0x146] == 0x03)
+        forceDmgSgb = !CartTocaPaletasCgb(romData);
+    if (!g_bus.loadRomFromData(std::move(romData), forceDmgSgb)) {
         g_rom_loaded = false;
         MessageBoxA(hWnd, "No se pudo cargar la ROM.", "Rew. Reborn", MB_OK | MB_ICONERROR);
         ActualizarEstadoMenusArchivo(hWnd);
@@ -5038,8 +5084,19 @@ INT_PTR CALLBACK AboutProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
 
 void MostrarAcercaDe(HWND hWnd) {
     g_about_text =
-        "Rew. Reborn v1.1.1\n"
+        "Rew. Reborn v1.1.2\n"
         "Emulador Game Boy / Game Boy Color\n\n"
+        "Novedades v1.1.2:\n"
+        "- Reproductor GBS: los archivos que no caben en 32 KiB\n"
+        "  ya se cargan con el mapper GBS (banco conmutable por\n"
+        "  escritura en 0x2000) en un ROM de hasta 4 MiB\n"
+        "- Reproductor GBS: play se llama como en gbsplay: desde\n"
+        "  VBlank si el GBS no usa timer, desde el timer si lo\n"
+        "  usa, y se respeta el handler ugetab en load+0x40/0x48\n"
+        "- Corregida la pantalla blanca de Medarot Card Robottle:\n"
+        "  los cartuchos GB Compatible (flag CGB 0x80) con SGB\n"
+        "  que nunca inicializan las paletas CGB se ejecutan como\n"
+        "  DMG+SGB en los modos Game Boy Color + SGB Border\n\n"
         "Novedades v1.1.1:\n"
         "- El cuadro Acerca de es ahora una ventana con\n"
         "  barra de desplazamiento (ya no se corta el\n"

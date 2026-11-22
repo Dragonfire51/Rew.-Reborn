@@ -140,8 +140,8 @@ BEGIN
     DEFPUSHBUTTON   "OK", IDOK, 263, 221, 50, 14
 END
 1 VERSIONINFO
-FILEVERSION     1,1,1,0
-PRODUCTVERSION  1,1,1,0
+FILEVERSION     1,1,2,0
+PRODUCTVERSION  1,1,2,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS__WINDOWS32
@@ -154,11 +154,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Rew. Reborn"
             VALUE "FileDescription",  "Game Boy / Game Boy Color Emulator"
-            VALUE "FileVersion",      "1.1.1.0"
+            VALUE "FileVersion",      "1.1.2.0"
             VALUE "InternalName",     "rew_reborn"
             VALUE "OriginalFilename", "rew_reborn.exe"
             VALUE "ProductName",      "Rew. Reborn"
-            VALUE "ProductVersion",   "1.1.1"
+            VALUE "ProductVersion",   "1.1.2"
         END
     END
     BLOCK "VarFileInfo"
