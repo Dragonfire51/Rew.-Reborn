@@ -30,9 +30,14 @@ entrada del procedimiento _ZSt28__throw_bad_array_new_lengthv".
 Compiling just the source (`-c`) is a fast syntax check.
 
 ## Version / release conventions
-- Version string: `vX.Y.Z-alpha`, used in three places in `Rew. Reborn.cpp`:
-  the About dialog (`MostrarAcercaDe`), the `CreateWindowExA` window title, and
-  the FPS `SetWindowTextA` update.
+- Version string: `vX.Y.Z`, used in three places in `Rew. Reborn.cpp`:
+  the About dialog text (`g_about_text` in `MostrarAcercaDe`), the window title
+  (`g_window_base_title`, used by `CreateWindowExA` and the FPS
+  `SetWindowTextA` update).
+- The About box is the `IDD_ABOUT` dialog (`AboutProc`): a read-only multiline
+  edit (`IDC_ABOUT_TEXT`, `ES_MULTILINE|ES_READONLY|WS_VSCROLL`) plus OK, so
+  the long changelog scrolls instead of producing a 1400 px MessageBox that
+  does not fit on small screens. Add new versions at the top of the text.
 - `resource.rc` VERSIONINFO must match: `FILEVERSION`/`PRODUCTVERSION` as
   `X,Y,Z,0` and the `FileVersion`/`ProductVersion` string values.
 - When the version or user-facing feature list changes, also update
@@ -42,6 +47,8 @@ Compiling just the source (`-c`) is a fast syntax check.
 - Keep `resource.rc` line endings as CRLF.
 
 ## Features (v1.1)
+- v1.1.1 turns the About box into a scrollable dialog (`IDD_ABOUT`) and keeps
+  the full changelog readable on any screen size.
 - v1.1.0 adds a GBS/NSF music player. `.gbs` and `.nsf` files are opened from
   `File > Load Rom` like any GB/GBC ROM (`CargarRomDesdeRuta` dispatches on the
   magic/extension to `CargarMusicaDesdeRuta`). While a music file plays,

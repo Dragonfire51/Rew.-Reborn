@@ -131,9 +131,17 @@ BEGIN
     DEFPUSHBUTTON   "OK",     IDOK,     150, 192, 50, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 205, 192, 50, 14
 	END
+IDD_ABOUT DIALOGEX 0, 0, 320, 236
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Acerca de Rew. Reborn"
+FONT 8, "MS Shell Dlg", 0, 0, 0x1
+BEGIN
+    EDITTEXT        IDC_ABOUT_TEXT, 7, 7, 306, 208, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "OK", IDOK, 263, 221, 50, 14
+END
 1 VERSIONINFO
-FILEVERSION     1,1,0,0
-PRODUCTVERSION  1,1,0,0
+FILEVERSION     1,1,1,0
+PRODUCTVERSION  1,1,1,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS__WINDOWS32
@@ -146,11 +154,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Rew. Reborn"
             VALUE "FileDescription",  "Game Boy / Game Boy Color Emulator"
-            VALUE "FileVersion",      "1.1.0.0"
+            VALUE "FileVersion",      "1.1.1.0"
             VALUE "InternalName",     "rew_reborn"
             VALUE "OriginalFilename", "rew_reborn.exe"
             VALUE "ProductName",      "Rew. Reborn"
-            VALUE "ProductVersion",   "1.1.0"
+            VALUE "ProductVersion",   "1.1.1"
         END
     END
     BLOCK "VarFileInfo"

@@ -12,7 +12,9 @@
 
 /* --- Dialogo de configuracion de teclas ---------------------------------- */
 #define IDD_KEY_SETTING         102
+#define IDD_ABOUT               103
 #define IDC_PLAYER_COMBO        1001
+#define IDC_ABOUT_TEXT          1002
 
 /* --- Menu File ----------------------------------------------------------- */
 #define ID_FILE_LOADROM         40001

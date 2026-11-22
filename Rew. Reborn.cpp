@@ -149,7 +149,7 @@ bool g_sgb_capture_pending = false;
 uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
 int  g_sgb_captured_count = 0;
 char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
-char g_window_base_title[MAX_PATH] = "Rew. Reborn v1.1.0";
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v1.1.1";
 // Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
 // modo que el sonido conserva su tono mientras la emulacion acelera. Si el
 // dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
@@ -5014,10 +5014,36 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
     return BuscarComandoMenuPorTexto(GetMenu(hWnd), commandId, wantedText);
 }
 
+static std::string g_about_text;
+
+INT_PTR CALLBACK AboutProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        HWND hEdit = GetDlgItem(hDlg, IDC_ABOUT_TEXT);
+        SetWindowTextA(hEdit, g_about_text.c_str());
+        SendMessageA(hEdit, EM_SETSEL, 0, 0);
+        SendMessageA(hEdit, WM_VSCROLL, SB_TOP, 0);
+        SetFocus(GetDlgItem(hDlg, IDOK));
+        return FALSE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+            EndDialog(hDlg, 0);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
 void MostrarAcercaDe(HWND hWnd) {
-    MessageBoxA(hWnd,
-        "Rew. Reborn v1.1.0\n"
+    g_about_text =
+        "Rew. Reborn v1.1.1\n"
         "Emulador Game Boy / Game Boy Color\n\n"
+        "Novedades v1.1.1:\n"
+        "- El cuadro Acerca de es ahora una ventana con\n"
+        "  barra de desplazamiento (ya no se corta el\n"
+        "  historial en pantallas pequenas)\n\n"
         "Novedades v1.1.0:\n"
         "- Reproductor de musica GBS (Game Boy Sound)\n"
         "  y NSF (NES Sound Format)\n"
@@ -5106,8 +5132,8 @@ void MostrarAcercaDe(HWND hWnd) {
         "Tests de Blargg: cpu_instrs, instr_timing,\n"
         "mem_timing, mem_timing-2, halt_bug,\n"
         "interrupt_time, dmg_sound, cgb_sound y\n"
-        "oam_bug (este \xFAltimo en modo DMG).",
-        "About", MB_OK | MB_ICONINFORMATION);
+        "oam_bug (este \xFAltimo en modo DMG).";
+    DialogBoxParamA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(IDD_ABOUT), hWnd, AboutProc, 0);
 }
 
 void ActualizarAutoFire() {
