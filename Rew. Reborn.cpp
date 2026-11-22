@@ -201,6 +201,9 @@ static const uint32_t kSgbAccent[SYSTEM_MODE_COUNT] = {
 };
 
 bool ModeUsesBorder(int mode) { return mode >= SYS_SGB; }
+// Modos que exponen la firma SGB (C=0x14) cuando la sesion corre en DMG: los
+// modos con borde SGB y Auto (que asi coloriza los juegos SGB sin borde).
+bool ModeExposesSgb(int mode) { return ModeUsesBorder(mode) || mode == SYS_AUTO; }
 bool ModeIsSgb(int mode) { return mode == SYS_SGB || mode == SYS_GB_SGB; }
 // El modo CGB se decide por la ROM; Initial SGB Border fuerza GBC.
 bool ModeForcesCgb(int mode) { return mode == SYS_GBC_SGB || mode == SYS_GBC_INIT_SGB; }
@@ -2297,7 +2300,7 @@ public:
         // DMG+SGB la exponen siempre; en los modos CGB+SGB la partida CGB
         // conserva C=0x00, pero un cartucho DMG corre como DMG+SGB y tambien la
         // recibe (igual que durante la captura del borde).
-        if (sgbSignatureMode || (!isCgbMode && ModeUsesBorder(g_model_pref) && !gbsPlayerMode)) c = 0x14;
+        if (sgbSignatureMode || (!isCgbMode && ModeExposesSgb(g_model_pref) && !gbsPlayerMode)) c = 0x14;
         pc = 0x100; sp = 0xFFFE;
         ime = imeEnablePending = halted = haltBugPending = false;
         divCounter = isCgbMode ? 0x1EA0 : 0xABCC;
@@ -2982,7 +2985,7 @@ public:
                 // El protocolo SGB (ICD2) solo existe en hardware SGB; en los
                 // demas modos las escrituras de joypad no deben decodificarse
                 // como paquetes.
-                if (!isCgbMode && !gbsPlayerMode && (sgbSignatureMode || ModeUsesBorder(g_model_pref)))
+                if (!isCgbMode && !gbsPlayerMode && (sgbSignatureMode || ModeExposesSgb(g_model_pref)))
                     sgbWriteP1(v);
                 return;
             }
@@ -5025,12 +5028,23 @@ static bool CargarMusicaDesdeRuta(HWND hWnd, const char* szFile, int type) {
 // 0x80) con soporte SGB son en realidad juegos DMG que nunca inicializan las
 // paletas CGB: en los modos CGB+SGB se quedan en pantalla blanca (Medarot Card
 // Robottle). Si en 3 s no las ha tocado, se ejecuta como DMG+SGB.
+// [v1.1.3] Mira si el cartucho llega a definir colores CGB de verdad. Escribir
+// los indices (FF68/FF6A) o pintar todo de blanco (0xFFFF, como hace Medarot)
+// no cuenta: en CGB la pantalla se queda en blanco porque las paletas nunca
+// salen del valor de encendido.
 static bool CartTocaPaletasCgb(const std::vector<uint8_t>& rom) {
     Bus probe;
     if (!probe.loadRomFromData(rom, false)) return true;
     if (!probe.isCgbMode) return true;
-    for (int i = 0; i < 180 && !probe.cgbPaletteTouched; ++i) probe.runFrame();
-    return probe.cgbPaletteTouched;
+    for (int i = 0; i < 240; ++i) {
+        probe.runFrame();
+        for (int k = 0; k < 64; k += 2) {
+            uint16_t bg = (uint16_t)(probe.bgPaletteRam[k] | (probe.bgPaletteRam[k + 1] << 8));
+            uint16_t ob = (uint16_t)(probe.objPaletteRam[k] | (probe.objPaletteRam[k + 1] << 8));
+            if ((bg & 0x7FFF) != 0x7FFF || (ob & 0x7FFF) != 0x7FFF) return true;
+        }
+    }
+    return false;
 }
 
 bool CargarRomDesdeRuta(HWND hWnd, const char* szFile) {
@@ -5042,7 +5056,9 @@ bool CargarRomDesdeRuta(HWND hWnd, const char* szFile) {
     std::ifstream fi(szFile, std::ios::binary);
     std::vector<uint8_t> romData((std::istreambuf_iterator<char>(fi)), std::istreambuf_iterator<char>());
     bool forceDmgSgb = false;
-    if (romData.size() > 0x150 && ModeForcesCgb(g_model_pref) &&
+    // Auto tambien prueba el fallback: un cartucho GB Compatible sin paletas
+    // CGB correria en CGB y quedaria en blanco; como DMG+SGB se coloriza.
+    if (romData.size() > 0x150 && (ModeForcesCgb(g_model_pref) || g_model_pref == SYS_AUTO) &&
         (romData[0x143] & 0x80) && !(romData[0x143] & 0x40) && romData[0x146] == 0x03)
         forceDmgSgb = !CartTocaPaletasCgb(romData);
     if (!g_bus.loadRomFromData(std::move(romData), forceDmgSgb)) {
@@ -5260,8 +5276,11 @@ void MostrarAcercaDe(HWND hWnd) {
         "  ATTR_TRN y ATTR_SET), capturados de la imagen como en\n"
         "  el SGB real (3 frames despues del paquete)\n"
         "- Medarot Card Robottle ya se ve en color en los modos\n"
-        "  Super Game Boy, Game Boy + SGB Border y Game Boy\n"
-        "  Color + SGB Border\n"
+        "  Super Game Boy, Game Boy + SGB Border, Game Boy\n"
+        "  Color + SGB Border y Auto\n"
+        "- El sondeo de paletas CGB ahora exige colores reales: un\n"
+        "  cartucho GB Compatible que solo escribe blanco (0xFFFF)\n"
+        "  corre como DMG+SGB en vez de quedarse en blanco\n"
         "- El protocolo SGB solo se decodifica en los modos SGB\n"
         "  (en DMG/CGB las escrituras de joypad ya no se\n"
         "  interpretan como paquetes)\n\n"

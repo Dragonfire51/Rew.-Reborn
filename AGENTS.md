@@ -63,10 +63,20 @@ Compiling just the source (`-c`) is a fast syntax check.
   tile's palette (SameBoy semantics). `sgbColorActive` is only set by these
   packets, so DMG/CGB games keep their normal palettes. The ICD2 P1 decoder is
   now gated to SGB modes (`!isCgbMode && !gbsPlayerMode && (sgbSignatureMode ||
-  ModeUsesBorder(...))`), so joypad writes are no longer decoded as packets in
-  DMG/CGB. Verified against SameBoy 1.0.5: Medarot's `PAL_TRN` captures
-  `7FFF 273F 10F8 0000` (white/orange/red/black) and the title screen matches.
-  Save-state version is 11.
+  ModeExposesSgb(...))`), so joypad writes are no longer decoded as packets in
+  DMG/CGB. `ModeExposesSgb(mode)` = `ModeUsesBorder(mode) || mode == SYS_AUTO`:
+  in Auto, sessions that run in DMG (no CGB palettes, or plain DMG carts) also
+  get `C=0x14`, so SGB-enhanced games are colorized without a border, while
+  real CGB sessions keep their GBC palettes. Verified against SameBoy 1.0.5:
+  Medarot's `PAL_TRN` captures `7FFF 273F 10F8 0000` (white/orange/red/black)
+  and the title screen matches. Save-state version is 11.
+  `CartTocaPaletasCgb()` (v1.1.2) was too lax: it returned true as soon as the
+  game wrote FF68-FF6B, and Medarot writes the palette index registers plus
+  pure white (`0xFFFF`) data, so it kept running in CGB. It now runs up to 240
+  frames and only returns true when some BG/OBJ palette entry differs from
+  white (`& 0x7FFF != 0x7FFF`). Medarot does set real CGB colors (it is a dual
+  DMG/GBC game), so it still runs in CGB and shows its GBC palette; carts that
+  only ever write white are forced to DMG+SGB instead of a white screen.
 - v1.1.2 fixes two player/rendering bugs:
   - GBS files larger than the free space below 0x8000 now load: `GbsBuildRom`
     sizes the synthetic ROM to `load + payload` (power of two, up to 4 MiB) and

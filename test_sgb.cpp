@@ -63,7 +63,10 @@ int main() {
     check(b.c == 0x14, "modo SGB expone la firma C=0x14");
     g_model_pref = SYS_AUTO;
     b.reset();
-    check(b.c == 0x13, "modo Auto conserva la firma DMG C=0x13");
+    check(b.c == 0x14, "modo Auto expone la firma SGB (coloriza los juegos SGB)");
+    g_model_pref = SYS_DMG;
+    b.reset();
+    check(b.c == 0x13, "modo DMG conserva la firma DMG C=0x13");
     g_model_pref = SYS_GB_SGB;   // los paquetes solo se decodifican en modo SGB
 
     // MLT_REQ (2 jugadores) => P1 devuelve IDs $xF, $xE al deseleccionar.
