@@ -1,5 +1,14 @@
 // ============================================================================
 // Rew. Reborn - Game Boy / Game Boy Color emulator (Win32)
+// v1.1.0: reproductor de musica GBS/NSF.
+//   - Los archivos .gbs (Game Boy Sound) y .nsf (NES Sound Format) se cargan
+//     desde File > Load Rom igual que una ROM de GB/GBC.
+//   - GBS: se monta un cartucho GB sintetico con un stub que llama a init/play
+//     desde la interrupcion del timer y se ejecuta en el nucleo GB.
+//   - NSF: se emula un 6502 (2A03) y la APU de NES (2 pulsos, triangulo,
+//     ruido y DMC); init recibe A=pista y play se llama a 60 Hz.
+//   - Al reproducir se muestra el titulo y "Music No.X/N" en rojo sobre negro;
+//     las flechas izquierda/derecha cambian de pista.
 // v1.0.0: primera version estable (fin de la etapa "alpha").
 //   - RTC MBC3 reescrita con la semantica binaria real del chip: los contadores
 //     de segundos/minutos/horas envuelven en 63/63/31 y solo acarrean desde
@@ -140,7 +149,7 @@ bool g_sgb_capture_pending = false;
 uint32_t g_sgb_captured_border[SGB_W * SGB_H] = {0};
 int  g_sgb_captured_count = 0;
 char g_rom_display_name[MAX_PATH] = {0};   // nombre del cartucho para el titulo
-char g_window_base_title[MAX_PATH] = "Rew. Reborn v1.0.0";
+char g_window_base_title[MAX_PATH] = "Rew. Reborn v1.1.0";
 // Speedup sincronizado con el audio: waveOut reproduce M veces mas rapido, de
 // modo que el sonido conserva su tono mientras la emulacion acelera. Si el
 // dispositivo no admite el cambio de frecuencia, se silencia mientras dura el
@@ -658,6 +667,1047 @@ constexpr uint8_t APU::kReadMask[0x17];
 constexpr uint8_t APU::kDuty[4][8];
 
 // ============================================================================
+// [v1.1.0] Reproductor NSF: CPU 6502 (2A03) y APU de NES.
+//
+// Los NSF son programas de NES: se ejecuta su rutina init (A = pista) y su
+// rutina play a ~60 Hz. Aqui se emula el subconjunto necesario (CPU 6502
+// oficial + opcodes ilegales habituales y la APU 2A03: 2 pulsos, triangulo,
+// ruido y DMC). La salida se mezcla a 44100 Hz en sampleBuf.
+// ============================================================================
+enum {
+    OP_INVALID = 0, OP_ADC, OP_AND, OP_ASL, OP_BCC, OP_BCS, OP_BEQ, OP_BIT,
+    OP_BMI, OP_BNE, OP_BPL, OP_BRK, OP_BVC, OP_BVS, OP_CLC, OP_CLD, OP_CLI,
+    OP_CLV, OP_CMP, OP_CPX, OP_CPY, OP_DEC, OP_DEX, OP_DEY, OP_EOR, OP_INC,
+    OP_INX, OP_INY, OP_JMP, OP_JSR, OP_LDA, OP_LDX, OP_LDY, OP_LSR, OP_NOP,
+    OP_ORA, OP_PHA, OP_PHP, OP_PLA, OP_PLP, OP_ROL, OP_ROR, OP_RTI, OP_RTS,
+    OP_SBC, OP_SEC, OP_SED, OP_SEI, OP_STA, OP_STX, OP_STY, OP_TAX, OP_TAY,
+    OP_TSX, OP_TXA, OP_TXS, OP_TYA,
+    OP_LAX, OP_SAX, OP_DCP, OP_ISC, OP_SLO, OP_RLA, OP_SRE, OP_RRA, OP_ANC,
+    OP_ALR, OP_ARR, OP_SBX, OP_AHX, OP_SHX, OP_SHY, OP_TAS, OP_LAS, OP_XAA
+};
+enum {
+    AM_IMP = 0, AM_ACC, AM_IMM, AM_ZP, AM_ZPX, AM_ZPY, AM_ABS, AM_ABSX,
+    AM_ABSY, AM_IND, AM_INDX, AM_INDY, AM_REL
+};
+
+static const uint8_t kOpMnemonic[256] = {
+    OP_BRK, OP_ORA, OP_INVALID, OP_SLO, OP_NOP, OP_ORA, OP_ASL, OP_SLO,
+    OP_PHP, OP_ORA, OP_ASL, OP_ANC, OP_NOP, OP_ORA, OP_ASL, OP_SLO,
+    OP_BPL, OP_ORA, OP_INVALID, OP_SLO, OP_NOP, OP_ORA, OP_ASL, OP_SLO,
+    OP_CLC, OP_ORA, OP_NOP, OP_SLO, OP_NOP, OP_ORA, OP_ASL, OP_SLO,
+    OP_JSR, OP_AND, OP_INVALID, OP_RLA, OP_BIT, OP_AND, OP_ROL, OP_RLA,
+    OP_PLP, OP_AND, OP_ROL, OP_ANC, OP_BIT, OP_AND, OP_ROL, OP_RLA,
+    OP_BMI, OP_AND, OP_INVALID, OP_RLA, OP_NOP, OP_AND, OP_ROL, OP_RLA,
+    OP_SEC, OP_AND, OP_NOP, OP_RLA, OP_NOP, OP_AND, OP_ROL, OP_RLA,
+    OP_RTI, OP_EOR, OP_INVALID, OP_SRE, OP_NOP, OP_EOR, OP_LSR, OP_SRE,
+    OP_PHA, OP_EOR, OP_LSR, OP_ALR, OP_JMP, OP_EOR, OP_LSR, OP_SRE,
+    OP_BVC, OP_EOR, OP_INVALID, OP_SRE, OP_NOP, OP_EOR, OP_LSR, OP_SRE,
+    OP_CLI, OP_EOR, OP_NOP, OP_SRE, OP_NOP, OP_EOR, OP_LSR, OP_SRE,
+    OP_RTS, OP_ADC, OP_INVALID, OP_RRA, OP_NOP, OP_ADC, OP_ROR, OP_RRA,
+    OP_PLA, OP_ADC, OP_ROR, OP_ARR, OP_JMP, OP_ADC, OP_ROR, OP_RRA,
+    OP_BVS, OP_ADC, OP_INVALID, OP_RRA, OP_NOP, OP_ADC, OP_ROR, OP_RRA,
+    OP_SEI, OP_ADC, OP_NOP, OP_RRA, OP_NOP, OP_ADC, OP_ROR, OP_RRA,
+    OP_NOP, OP_STA, OP_NOP, OP_SAX, OP_STY, OP_STA, OP_STX, OP_SAX,
+    OP_DEY, OP_NOP, OP_TXA, OP_XAA, OP_STY, OP_STA, OP_STX, OP_SAX,
+    OP_BCC, OP_STA, OP_INVALID, OP_AHX, OP_STY, OP_STA, OP_STX, OP_SAX,
+    OP_TYA, OP_STA, OP_TXS, OP_TAS, OP_SHY, OP_STA, OP_SHX, OP_AHX,
+    OP_LDY, OP_LDA, OP_LDX, OP_LAX, OP_LDY, OP_LDA, OP_LDX, OP_LAX,
+    OP_TAY, OP_LDA, OP_TAX, OP_LAX, OP_LDY, OP_LDA, OP_LDX, OP_LAX,
+    OP_BCS, OP_LDA, OP_INVALID, OP_LAX, OP_LDY, OP_LDA, OP_LDX, OP_LAX,
+    OP_CLV, OP_LDA, OP_TSX, OP_LAS, OP_LDY, OP_LDA, OP_LDX, OP_LAX,
+    OP_CPY, OP_CMP, OP_NOP, OP_DCP, OP_CPY, OP_CMP, OP_DEC, OP_DCP,
+    OP_INY, OP_CMP, OP_DEX, OP_SBX, OP_CPY, OP_CMP, OP_DEC, OP_DCP,
+    OP_BNE, OP_CMP, OP_INVALID, OP_DCP, OP_NOP, OP_CMP, OP_DEC, OP_DCP,
+    OP_CLD, OP_CMP, OP_NOP, OP_DCP, OP_NOP, OP_CMP, OP_DEC, OP_DCP,
+    OP_CPX, OP_SBC, OP_NOP, OP_ISC, OP_CPX, OP_SBC, OP_INC, OP_ISC,
+    OP_INX, OP_SBC, OP_NOP, OP_SBC, OP_CPX, OP_SBC, OP_INC, OP_ISC,
+    OP_BEQ, OP_SBC, OP_INVALID, OP_ISC, OP_NOP, OP_SBC, OP_INC, OP_ISC,
+    OP_SED, OP_SBC, OP_NOP, OP_ISC, OP_NOP, OP_SBC, OP_INC, OP_ISC,
+};
+static const uint8_t kOpMode[256] = {
+    AM_IMP, AM_INDX, AM_IMP, AM_INDX, AM_ZP, AM_ZP, AM_ZP, AM_ZP,
+    AM_IMP, AM_IMM, AM_ACC, AM_IMM, AM_ABS, AM_ABS, AM_ABS, AM_ABS,
+    AM_REL, AM_INDY, AM_IMP, AM_INDY, AM_ZPX, AM_ZPX, AM_ZPX, AM_ZPX,
+    AM_IMP, AM_ABSY, AM_IMP, AM_ABSY, AM_ABSX, AM_ABSX, AM_ABSX, AM_ABSX,
+    AM_ABS, AM_INDX, AM_IMP, AM_INDX, AM_ZP, AM_ZP, AM_ZP, AM_ZP,
+    AM_IMP, AM_IMM, AM_ACC, AM_IMM, AM_ABS, AM_ABS, AM_ABS, AM_ABS,
+    AM_REL, AM_INDY, AM_IMP, AM_INDY, AM_ZPX, AM_ZPX, AM_ZPX, AM_ZPX,
+    AM_IMP, AM_ABSY, AM_IMP, AM_ABSY, AM_ABSX, AM_ABSX, AM_ABSX, AM_ABSX,
+    AM_IMP, AM_INDX, AM_IMP, AM_INDX, AM_ZP, AM_ZP, AM_ZP, AM_ZP,
+    AM_IMP, AM_IMM, AM_ACC, AM_IMM, AM_ABS, AM_ABS, AM_ABS, AM_ABS,
+    AM_REL, AM_INDY, AM_IMP, AM_INDY, AM_ZPX, AM_ZPX, AM_ZPX, AM_ZPX,
+    AM_IMP, AM_ABSY, AM_IMP, AM_ABSY, AM_ABSX, AM_ABSX, AM_ABSX, AM_ABSX,
+    AM_IMP, AM_INDX, AM_IMP, AM_INDX, AM_ZP, AM_ZP, AM_ZP, AM_ZP,
+    AM_IMP, AM_IMM, AM_ACC, AM_IMM, AM_IND, AM_ABS, AM_ABS, AM_ABS,
+    AM_REL, AM_INDY, AM_IMP, AM_INDY, AM_ZPX, AM_ZPX, AM_ZPX, AM_ZPX,
+    AM_IMP, AM_ABSY, AM_IMP, AM_ABSY, AM_ABSX, AM_ABSX, AM_ABSX, AM_ABSX,
+    AM_IMM, AM_INDX, AM_IMM, AM_INDX, AM_ZP, AM_ZP, AM_ZP, AM_ZP,
+    AM_IMP, AM_IMM, AM_IMP, AM_IMM, AM_ABS, AM_ABS, AM_ABS, AM_ABS,
+    AM_REL, AM_INDY, AM_IMP, AM_INDY, AM_ZPX, AM_ZPX, AM_ZPY, AM_ZPY,
+    AM_IMP, AM_ABSY, AM_IMP, AM_ABSY, AM_ABSX, AM_ABSX, AM_ABSY, AM_ABSY,
+    AM_IMM, AM_INDX, AM_IMM, AM_INDX, AM_ZP, AM_ZP, AM_ZP, AM_ZP,
+    AM_IMP, AM_IMM, AM_IMP, AM_IMM, AM_ABS, AM_ABS, AM_ABS, AM_ABS,
+    AM_REL, AM_INDY, AM_IMP, AM_INDY, AM_ZPX, AM_ZPX, AM_ZPY, AM_ZPY,
+    AM_IMP, AM_ABSY, AM_IMP, AM_ABSY, AM_ABSX, AM_ABSX, AM_ABSY, AM_ABSY,
+    AM_IMM, AM_INDX, AM_IMM, AM_INDX, AM_ZP, AM_ZP, AM_ZP, AM_ZP,
+    AM_IMP, AM_IMM, AM_IMP, AM_IMM, AM_ABS, AM_ABS, AM_ABS, AM_ABS,
+    AM_REL, AM_INDY, AM_IMP, AM_INDY, AM_ZPX, AM_ZPX, AM_ZPX, AM_ZPX,
+    AM_IMP, AM_ABSY, AM_IMP, AM_ABSY, AM_ABSX, AM_ABSX, AM_ABSX, AM_ABSX,
+    AM_IMM, AM_INDX, AM_IMM, AM_INDX, AM_ZP, AM_ZP, AM_ZP, AM_ZP,
+    AM_IMP, AM_IMM, AM_IMP, AM_IMM, AM_ABS, AM_ABS, AM_ABS, AM_ABS,
+    AM_REL, AM_INDY, AM_IMP, AM_INDY, AM_ZPX, AM_ZPX, AM_ZPX, AM_ZPX,
+    AM_IMP, AM_ABSY, AM_IMP, AM_ABSY, AM_ABSX, AM_ABSX, AM_ABSX, AM_ABSX,
+};
+
+class NsfPlayer;
+
+class CPU6502 {
+public:
+    enum { FC = 0x01, FZ = 0x02, FI = 0x04, FD = 0x08, FB = 0x10,
+           FU = 0x20, FV = 0x40, FN = 0x80 };
+    uint8_t a = 0, x = 0, y = 0, s = 0xFD, p = 0x24;
+    uint16_t pc = 0;
+    bool jam = false, returned = false;
+    NsfPlayer* bus = nullptr;
+
+    uint8_t read(uint16_t addr);
+    void write(uint16_t addr, uint8_t v);
+    void push(uint8_t v) { write((uint16_t)(0x0100 | s), v); --s; }
+    uint8_t pull() { ++s; return read((uint16_t)(0x0100 | s)); }
+
+    void setzn(uint8_t v) { p = (uint8_t)((p & ~(FN | FZ)) | (v & FN) | (v ? 0 : FZ)); }
+    void setc(bool c) { if (c) p |= FC; else p = (uint8_t)(p & ~FC); }
+    void setv(bool v) { if (v) p |= FV; else p = (uint8_t)(p & ~FV); }
+
+    void adc(uint8_t v) {
+        unsigned sum = (unsigned)a + v + ((p & FC) ? 1u : 0u);
+        setc(sum > 0xFF);
+        setv((~(a ^ v) & (a ^ sum) & 0x80) != 0);
+        a = (uint8_t)sum;
+        setzn(a);
+    }
+    void sbc(uint8_t v) { adc((uint8_t)(v ^ 0xFF)); }
+    void cmp(uint8_t r, uint8_t v) {
+        unsigned d = (unsigned)r - v;
+        setc(r >= v);
+        setzn((uint8_t)d);
+    }
+
+    uint16_t resolve(uint8_t mode);
+    void step();
+    bool call(uint16_t addr, int maxInstr = 200000);
+    void reset() { a = x = y = 0; s = 0xFD; p = 0x24; pc = 0; jam = false; returned = false; }
+};
+
+// ---------------------------------------------------------------------------
+// APU 2A03 (NTSC/PAL): pulsos, triangulo, ruido y DMC.
+// ---------------------------------------------------------------------------
+class NesApu {
+public:
+    static constexpr int SAMPLE_RATE = 44100;
+    static constexpr int BUF_SAMPLES = 4096;
+    int16_t sampleBuf[BUF_SAMPLES * 2] = {0};
+    int sampleCount = 0;
+
+    typedef uint8_t (*ReadFn)(void*, uint16_t);
+    void* readCtx = nullptr;
+    ReadFn readFn = nullptr;
+    uint8_t readBus(uint16_t addr) { return readFn ? readFn(readCtx, addr) : 0; }
+
+    struct Envelope {
+        int period = 0, divider = 0, decay = 0;
+        bool start = false, loop = false, constant = false;
+    };
+    struct Pulse {
+        bool enabled = false;
+        int length = 0, timer = 0, timerPeriod = 0, dutyPos = 0, duty = 0;
+        Envelope env;
+        bool sweepEnable = false, sweepNegate = false, sweepReload = false;
+        int sweepPeriod = 0, sweepShift = 0, sweepTimer = 0;
+        bool lengthHalt = false;
+    };
+    struct Triangle {
+        bool enabled = false;
+        int length = 0, timer = 1, timerPeriod = 0, step = 0;
+        int linearCounter = 0, linearReload = 0;
+        bool linearControl = false, linearReloadFlag = false, lengthHalt = false;
+    };
+    struct Noise {
+        bool enabled = false;
+        int length = 0, timer = 4, timerPeriod = 4;
+        Envelope env;
+        bool lengthHalt = false, mode = false;
+        uint16_t lfsr = 1;
+    };
+    struct Dmc {
+        bool enabled = false, irqEnable = false, loop = false, irq = false;
+        int rateIndex = 0, timer = 428, timerPeriod = 428;
+        int outputLevel = 0;
+        int sampleAddr = 0xC000, sampleLen = 1, bytesRemaining = 0, currentAddr = 0xC000;
+        uint8_t shiftReg = 0;
+        int bitsRemaining = 0;
+    };
+
+    Pulse pulse[2];
+    Triangle tri;
+    Noise noise;
+    Dmc dmc;
+    uint8_t reg[0x18] = {0};
+    bool palMode = false;
+    bool frameMode5 = false, irqInhibit = false, frameIrq = false;
+    int frameCycle = 0, frameStep = 0;
+    int64_t samplePhase = 0;
+    double capL = 0.0, capR = 0.0;
+
+    static constexpr uint8_t kLength[32] = {
+        0x0A, 0xFE, 0x14, 0x02, 0x28, 0x04, 0x50, 0x06,
+        0xA0, 0x08, 0x3C, 0x0A, 0x0E, 0x0C, 0x1A, 0x0E,
+        0x0C, 0x10, 0x18, 0x12, 0x30, 0x14, 0x60, 0x16,
+        0xC0, 0x18, 0x48, 0x1A, 0x10, 0x1C, 0x20, 0x1E
+    };
+    static constexpr uint16_t kNoisePeriod[16] = {
+        4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068
+    };
+    static constexpr uint16_t kDmcRate[16] = {
+        428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54
+    };
+    static constexpr uint8_t kDuty[4][8] = {
+        {0,1,0,0,0,0,0,0}, {0,1,1,0,0,0,0,0},
+        {0,1,1,1,1,0,0,0}, {1,0,0,1,1,1,1,1}
+    };
+    static constexpr uint8_t kTriangle[32] = {
+        15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0,
+        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+    };
+
+    void reset(bool pal) {
+        palMode = pal;
+        for (int i = 0; i < 0x18; ++i) reg[i] = 0;
+        pulse[0] = Pulse{}; pulse[1] = Pulse{};
+        tri = Triangle{}; noise = Noise{}; dmc = Dmc{};
+        noise.timer = 4; noise.timerPeriod = 4; noise.lfsr = 1;
+        dmc.timer = 428; dmc.timerPeriod = 428; dmc.sampleAddr = 0xC000;
+        dmc.sampleLen = 1; dmc.currentAddr = 0xC000;
+        frameMode5 = irqInhibit = frameIrq = false;
+        frameCycle = 0; frameStep = 0;
+        samplePhase = 0; sampleCount = 0; capL = capR = 0.0;
+    }
+
+    void clockEnvelope(Envelope& e) {
+        if (e.start) { e.start = false; e.divider = e.period; e.decay = 15; }
+        else if (--e.divider < 0) {
+            e.divider = e.period;
+            if (e.decay || e.loop) e.decay = (e.decay - 1) & 15;
+        }
+    }
+    int envVolume(const Envelope& e, int length) const {
+        if (length == 0) return 0;
+        return e.constant ? e.period : e.decay;
+    }
+
+    void clockLength(Pulse& p) { if (p.length && !p.lengthHalt) --p.length; }
+    void clockLength(Noise& n) { if (n.length && !n.lengthHalt) --n.length; }
+    void clockLengthTriangle() { if (tri.length && !tri.lengthHalt) --tri.length; }
+
+    void clockSweep(Pulse& p, int negAdjust) {
+        if (--p.sweepTimer < 0) {
+            p.sweepReload = true;
+            int period = p.timerPeriod;
+            int shift = p.sweepShift;
+            if (shift && p.sweepEnable && period >= 8) {
+                int offset = period >> shift;
+                if (p.sweepNegate) offset = negAdjust - offset;
+                int target = period + offset;
+                if (target >= 0 && target < 0x800) p.timerPeriod = target;
+            }
+        }
+        if (p.sweepReload) { p.sweepReload = false; p.sweepTimer = p.sweepPeriod; }
+    }
+    bool sweepMute(const Pulse& p) const {
+        if (p.timerPeriod < 8) return true;
+        int offset = p.sweepShift ? (p.timerPeriod >> p.sweepShift) : 0;
+        if (p.sweepNegate) offset = -offset;
+        return p.timerPeriod + offset > 0x7FF;
+    }
+    int pulseOut(int i) const {
+        const Pulse& p = pulse[i];
+        if (!p.enabled || p.length == 0) return 0;
+        if (p.timerPeriod < 8 || sweepMute(p)) return 0;
+        if (!kDuty[p.duty & 3][p.dutyPos & 7]) return 0;
+        return envVolume(p.env, p.length);
+    }
+    int triangleOut() const {
+        if (!tri.enabled || tri.length == 0 || tri.linearCounter == 0) return 0;
+        return kTriangle[tri.step & 31];
+    }
+    int noiseOut() const {
+        if (!noise.enabled || noise.length == 0) return 0;
+        if (!(noise.lfsr & 1)) return 0;
+        return envVolume(noise.env, noise.length);
+    }
+    int dmcOut() const { return dmc.outputLevel; }
+
+    void clockLinear() {
+        if (tri.linearReloadFlag) tri.linearCounter = tri.linearReload;
+        else if (tri.linearCounter) --tri.linearCounter;
+        if (!tri.linearControl) tri.linearReloadFlag = false;
+    }
+    void clockQuarter() {
+        clockEnvelope(pulse[0].env); clockEnvelope(pulse[1].env);
+        clockEnvelope(noise.env);
+        clockLinear();
+    }
+    void clockHalf() {
+        clockLength(pulse[0]); clockLength(pulse[1]);
+        clockLength(noise); clockLengthTriangle();
+        clockSweep(pulse[0], -1); clockSweep(pulse[1], 0);
+    }
+    void clockFrame() {
+        if (++frameCycle < (palMode ? 8313 : 7457)) return;
+        frameCycle = 0;
+        if (!frameMode5) {
+            switch (frameStep) {
+                case 0: clockQuarter(); break;
+                case 1: clockHalf(); break;
+                case 2: clockQuarter(); break;
+                case 3: clockHalf(); if (!irqInhibit) frameIrq = true; break;
+            }
+            frameStep = (frameStep + 1) & 3;
+        } else {
+            if (frameStep == 0) clockQuarter();
+            else if (frameStep == 1) clockHalf();
+            else if (frameStep == 2) clockQuarter();
+            else if (frameStep == 4) clockHalf();
+            if (++frameStep >= 5) frameStep = 0;
+        }
+    }
+
+    void clockDmc() {
+        if (dmc.bitsRemaining == 0) {
+            if (dmc.bytesRemaining == 0) return;
+            dmc.shiftReg = readBus((uint16_t)dmc.currentAddr);
+            if (++dmc.currentAddr > 0xFFFF) dmc.currentAddr = 0x8000;
+            if (dmc.currentAddr < 0x8000) dmc.currentAddr = 0x8000;
+            --dmc.bytesRemaining;
+            dmc.bitsRemaining = 8;
+            if (dmc.bytesRemaining == 0) {
+                if (dmc.loop) {
+                    dmc.currentAddr = dmc.sampleAddr;
+                    dmc.bytesRemaining = dmc.sampleLen;
+                } else if (dmc.irqEnable) {
+                    dmc.irq = true;
+                }
+            }
+        }
+        int bit = dmc.shiftReg & 1;
+        dmc.shiftReg >>= 1;
+        --dmc.bitsRemaining;
+        if (bit) { if (dmc.outputLevel <= 125) dmc.outputLevel += 2; }
+        else     { if (dmc.outputLevel >= 2)   dmc.outputLevel -= 2; }
+    }
+
+    void clock() {
+        for (int i = 0; i < 2; ++i) {
+            Pulse& p = pulse[i];
+            if (--p.timer < 0) {
+                p.timer += (p.timerPeriod + 1) * 2;
+                p.dutyPos = (p.dutyPos + 1) & 7;
+            }
+        }
+        if (--tri.timer < 0) { tri.timer += tri.timerPeriod + 1; tri.step = (tri.step + 1) & 31; }
+        if (--noise.timer < 0) {
+            noise.timer += noise.timerPeriod;
+            uint16_t fb = (uint16_t)((noise.lfsr & 1) ^ ((noise.lfsr >> 1) & 1));
+            noise.lfsr >>= 1;
+            if (fb) noise.lfsr |= 0x4000;
+            if (noise.mode) {
+                if (fb) noise.lfsr |= 0x40;
+                else noise.lfsr = (uint16_t)(noise.lfsr & ~0x40);
+            }
+        }
+        if (--dmc.timer < 0) { dmc.timer += dmc.timerPeriod; clockDmc(); }
+        clockFrame();
+
+        samplePhase += SAMPLE_RATE;
+        int64_t cpuClock = palMode ? 1662607 : 1789773;
+        if (samplePhase >= cpuClock) { samplePhase -= cpuClock; emitSample(); }
+    }
+
+    void emitSample() {
+        int p = pulseOut(0) + pulseOut(1);
+        double pulseMix = p > 0 ? 95.88 / (8128.0 / p + 100.0) : 0.0;
+        double tnd = triangleOut() / 8227.0 + noiseOut() / 12241.0 + dmcOut() / 22638.0;
+        double tndMix = tnd > 0.0 ? 159.79 / (1.0 / tnd + 100.0) : 0.0;
+        double out = (pulseMix + tndMix) * 40000.0;
+        double ol = out - capL; capL = out - ol * 0.996;
+        auto clip = [](double v) -> int16_t {
+            if (v > 32767.0) v = 32767.0;
+            if (v < -32768.0) v = -32768.0;
+            return (int16_t)v;
+        };
+        int16_t smp = clip(ol);
+        if (sampleCount + 2 <= BUF_SAMPLES * 2) {
+            sampleBuf[sampleCount++] = smp;
+            sampleBuf[sampleCount++] = smp;
+        }
+    }
+
+    uint8_t readStatus() {
+        uint8_t st = 0;
+        if (pulse[0].length) st |= 0x01;
+        if (pulse[1].length) st |= 0x02;
+        if (tri.length) st |= 0x04;
+        if (noise.length) st |= 0x08;
+        if (dmc.bytesRemaining) st |= 0x10;
+        if (frameIrq) st |= 0x40;
+        frameIrq = false;
+        return st;
+    }
+    uint8_t read(uint16_t addr) {
+        if (addr == 0x4015) return readStatus();
+        if (addr >= 0x4000 && addr < 0x4018) return reg[addr - 0x4000];
+        return 0;
+    }
+
+    void write(uint16_t addr, uint8_t v) {
+        if (addr < 0x4000 || addr > 0x4017) return;
+        reg[addr - 0x4000] = v;
+        switch (addr) {
+            case 0x4000: case 0x4004: {
+                Pulse& p = pulse[(addr - 0x4000) >> 2];
+                p.duty = v >> 6;
+                p.lengthHalt = (v & 0x20) != 0;
+                p.env.loop = (v & 0x20) != 0;
+                p.env.constant = (v & 0x10) != 0;
+                p.env.period = v & 15;
+                break;
+            }
+            case 0x4001: case 0x4005: {
+                Pulse& p = pulse[(addr - 0x4000) >> 2];
+                p.sweepEnable = (v & 0x80) != 0;
+                p.sweepPeriod = (v >> 4) & 7;
+                p.sweepNegate = (v & 0x08) != 0;
+                p.sweepShift = v & 7;
+                p.sweepReload = true;
+                break;
+            }
+            case 0x4002: case 0x4006: {
+                Pulse& p = pulse[(addr - 0x4000) >> 2];
+                p.timerPeriod = (p.timerPeriod & 0x700) | v;
+                break;
+            }
+            case 0x4003: case 0x4007: {
+                Pulse& p = pulse[(addr - 0x4000) >> 2];
+                p.timerPeriod = (p.timerPeriod & 0xFF) | ((v & 7) << 8);
+                if (p.enabled) p.length = kLength[(v >> 3) & 0x1F];
+                p.dutyPos = 0;
+                p.env.start = true;
+                break;
+            }
+            case 0x4008:
+                tri.linearControl = (v & 0x80) != 0;
+                tri.linearReload = v & 0x7F;
+                tri.lengthHalt = (v & 0x80) != 0;
+                break;
+            case 0x400A:
+                tri.timerPeriod = (tri.timerPeriod & 0x700) | v;
+                break;
+            case 0x400B:
+                tri.timerPeriod = (tri.timerPeriod & 0xFF) | ((v & 7) << 8);
+                if (tri.enabled) tri.length = kLength[(v >> 3) & 0x1F];
+                tri.linearReloadFlag = true;
+                break;
+            case 0x400C:
+                noise.lengthHalt = (v & 0x20) != 0;
+                noise.env.loop = (v & 0x20) != 0;
+                noise.env.constant = (v & 0x10) != 0;
+                noise.env.period = v & 15;
+                break;
+            case 0x400E:
+                noise.mode = (v & 0x80) != 0;
+                noise.timerPeriod = kNoisePeriod[v & 15];
+                break;
+            case 0x400F:
+                if (noise.enabled) noise.length = kLength[(v >> 3) & 0x1F];
+                noise.env.start = true;
+                break;
+            case 0x4010:
+                dmc.irqEnable = (v & 0x80) != 0;
+                dmc.loop = (v & 0x40) != 0;
+                dmc.rateIndex = v & 15;
+                dmc.timerPeriod = kDmcRate[v & 15];
+                if (!dmc.irqEnable) dmc.irq = false;
+                break;
+            case 0x4011:
+                dmc.outputLevel = v & 0x7F;
+                break;
+            case 0x4012:
+                dmc.sampleAddr = 0xC000 + ((v & 0xFF) << 6);
+                break;
+            case 0x4013:
+                dmc.sampleLen = ((v & 0xFF) << 4) + 1;
+                break;
+            case 0x4015: {
+                bool was = dmc.enabled;
+                pulse[0].enabled = (v & 0x01) != 0;
+                pulse[1].enabled = (v & 0x02) != 0;
+                tri.enabled = (v & 0x04) != 0;
+                noise.enabled = (v & 0x08) != 0;
+                dmc.enabled = (v & 0x10) != 0;
+                if (!pulse[0].enabled) pulse[0].length = 0;
+                if (!pulse[1].enabled) pulse[1].length = 0;
+                if (!tri.enabled) tri.length = 0;
+                if (!noise.enabled) noise.length = 0;
+                if (dmc.enabled && !was) {
+                    dmc.currentAddr = dmc.sampleAddr;
+                    dmc.bytesRemaining = dmc.sampleLen;
+                    dmc.bitsRemaining = 0;
+                } else if (!dmc.enabled) {
+                    dmc.bytesRemaining = 0;
+                }
+                break;
+            }
+            case 0x4017:
+                frameMode5 = (v & 0x80) != 0;
+                irqInhibit = (v & 0x40) != 0;
+                frameIrq = false;
+                frameStep = 0;
+                frameCycle = 0;
+                if (frameMode5) { clockQuarter(); clockHalf(); }
+                break;
+            default:
+                break;
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Reproductor NSF: memoria, CPU y planificacion de init/play.
+// ---------------------------------------------------------------------------
+class NsfPlayer {
+public:
+    std::vector<uint8_t> rom;          // datos tras la cabecera (0x80)
+    std::vector<uint8_t> romImage;     // imagen plana de 64 KiB si no hay bancos
+    uint8_t ram[0x800] = {0};
+    uint8_t sram[0x2000] = {0};
+    uint8_t bankReg[8] = {0,1,2,3,4,5,6,7};
+    uint8_t initialBank[8] = {0,1,2,3,4,5,6,7};
+    bool banked = false;
+    bool ready = false;
+    bool palMode = false;
+    int totalSongs = 0, firstSong = 1, currentSong = 1;
+    uint16_t loadAddr = 0x8000, initAddr = 0x8000, playAddr = 0x8000;
+    uint16_t ntscSpeed = 16639, palSpeed = 19997;
+    uint8_t speedFlags = 0, chipFlags = 0;
+    double frameRateHz = 60.0988;
+    int cyclesPerFrame = 29780;
+    std::string title, author, copyright;
+
+    CPU6502 cpu;
+    NesApu apu;
+    uint8_t savedA = 0, savedX = 0, savedY = 0, savedS = 0xFD, savedP = 0x24;
+
+    static uint16_t le16(const std::vector<uint8_t>& d, size_t o) {
+        return (uint16_t)(d[o] | (d[o + 1] << 8));
+    }
+    static std::string field(const std::vector<uint8_t>& d, size_t o, size_t n) {
+        std::string s;
+        for (size_t i = 0; i < n && o + i < d.size(); ++i) {
+            uint8_t c = d[o + i];
+            if (c == 0) break;
+            s.push_back((c >= 32 && c < 127) ? (char)c : ' ');
+        }
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        return s;
+    }
+
+    bool load(const std::vector<uint8_t>& data) {
+        if (data.size() < 0x80 || memcmp(data.data(), "NESM\x1A", 5) != 0) return false;
+        totalSongs = data[0x06];
+        if (totalSongs <= 0) totalSongs = 1;
+        firstSong = data[0x07] ? data[0x07] : 1;
+        loadAddr = le16(data, 0x08); if (!loadAddr) loadAddr = 0x8000;
+        initAddr = le16(data, 0x0A); if (!initAddr) initAddr = loadAddr;
+        playAddr = le16(data, 0x0C); if (!playAddr) playAddr = loadAddr;
+        title = field(data, 0x0E, 32);
+        author = field(data, 0x2E, 32);
+        copyright = field(data, 0x4E, 32);
+        ntscSpeed = le16(data, 0x6E); if (!ntscSpeed) ntscSpeed = 16639;
+        palSpeed = le16(data, 0x78); if (!palSpeed) palSpeed = 19997;
+        speedFlags = data[0x7A];
+        chipFlags = data[0x7B];
+        palMode = (speedFlags & 3) == 1;
+        rom.assign(data.begin() + 0x80, data.end());
+        if (loadAddr < 0x8000) return false;
+
+        banked = rom.size() > 0x8000;
+        if (banked) {
+            int totalBanks = (int)(rom.size() / 0x1000);
+            int firstBank = (loadAddr - 0x8000) / 0x1000;
+            for (int i = 0; i < 8; ++i) {
+                int b = i - firstBank;
+                bankReg[i] = (uint8_t)((b >= 0 && b < totalBanks) ? b : 0);
+            }
+            bool headerBanks = false;
+            for (int i = 0; i < 8; ++i)
+                if (data[0x70 + i]) headerBanks = true;
+            if (headerBanks)
+                for (int i = 0; i < 8; ++i) bankReg[i] = data[0x70 + i];
+        } else {
+            romImage.assign(0x10000, 0);
+            size_t n = rom.size();
+            if (loadAddr + n > 0x10000) n = 0x10000 - loadAddr;
+            memcpy(romImage.data() + loadAddr, rom.data(), n);
+        }
+
+        double speed = palMode ? (double)palSpeed : (double)ntscSpeed;
+        if (speed <= 0.0) speed = palMode ? 19997.0 : 16639.0;
+        frameRateHz = 1000000.0 / speed;
+        if (frameRateHz < 40.0 || frameRateHz > 70.0)
+            frameRateHz = palMode ? 50.0 : 60.0988;
+        double clock = palMode ? 1662607.125 : 1789772.727;
+        cyclesPerFrame = (int)(clock / frameRateHz + 0.5);
+        memcpy(initialBank, bankReg, sizeof(initialBank));
+        ready = false;
+        return true;
+    }
+
+    bool startSong(int song) {
+        if (rom.empty()) return false;
+        currentSong = song;
+        memcpy(bankReg, initialBank, sizeof(bankReg));
+        memset(ram, 0, sizeof(ram));
+        memset(sram, 0, sizeof(sram));
+        cpu.reset();
+        cpu.bus = this;
+        apu.reset(palMode);
+        apu.readCtx = this;
+        apu.readFn = [](void* p, uint16_t a) -> uint8_t {
+            return ((NsfPlayer*)p)->read6502(a);
+        };
+        apu.write(0x4015, 0x0F);
+        apu.write(0x4017, 0x40);
+
+        cpu.a = (uint8_t)song;
+        cpu.x = palMode ? 1 : 0;
+        cpu.y = 0;
+        cpu.s = 0xFD;
+        cpu.p = 0x24;
+        cpu.call(initAddr, 500000);
+        savedA = cpu.a; savedX = cpu.x; savedY = cpu.y;
+        savedS = cpu.s; savedP = cpu.p;
+        ready = true;
+        return true;
+    }
+
+    void runFrame() {
+        if (!ready) return;
+        if (playAddr) {
+            cpu.a = savedA; cpu.x = savedX; cpu.y = savedY;
+            cpu.s = savedS; cpu.p = savedP;
+            cpu.call(playAddr, 200000);
+        }
+        for (int i = 0; i < cyclesPerFrame; ++i) apu.clock();
+    }
+
+    uint8_t read6502(uint16_t addr) {
+        if (addr < 0x2000) return ram[addr & 0x7FF];
+        if (addr < 0x4000) return ram[addr & 0x7FF];
+        if (addr < 0x4020) return apu.read(addr);
+        if (addr < 0x6000) return 0;
+        if (addr < 0x8000) return sram[addr - 0x6000];
+        if (!banked) return romImage[addr];
+        int slot = (addr - 0x8000) >> 12;
+        int off = (int)bankReg[slot] * 0x1000 + (addr & 0xFFF);
+        return (off >= 0 && off < (int)rom.size()) ? rom[off] : 0;
+    }
+    void write6502(uint16_t addr, uint8_t v) {
+        if (addr < 0x2000) { ram[addr & 0x7FF] = v; return; }
+        if (addr < 0x4000) { ram[addr & 0x7FF] = v; return; }
+        if (addr >= 0x4000 && addr <= 0x4017) { apu.write(addr, v); return; }
+        if (addr >= 0x5FF8 && addr <= 0x5FFF) { bankReg[addr - 0x5FF8] = v; return; }
+        if (addr >= 0x6000 && addr < 0x8000) { sram[addr - 0x6000] = v; return; }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// CPU 6502: implementacion de accesos y ejecucion.
+// ---------------------------------------------------------------------------
+uint8_t CPU6502::read(uint16_t addr) { return bus ? bus->read6502(addr) : 0; }
+void CPU6502::write(uint16_t addr, uint8_t v) { if (bus) bus->write6502(addr, v); }
+
+uint16_t CPU6502::resolve(uint8_t mode) {
+    switch (mode) {
+        case AM_IMM: return pc++;
+        case AM_ZP: return read(pc++);
+        case AM_ZPX: return (uint8_t)(read(pc++) + x);
+        case AM_ZPY: return (uint8_t)(read(pc++) + y);
+        case AM_ABS: {
+            uint8_t lo = read(pc++), hi = read(pc++);
+            return (uint16_t)(lo | (hi << 8));
+        }
+        case AM_ABSX: {
+            uint8_t lo = read(pc++), hi = read(pc++);
+            return (uint16_t)((lo | (hi << 8)) + x);
+        }
+        case AM_ABSY: {
+            uint8_t lo = read(pc++), hi = read(pc++);
+            return (uint16_t)((lo | (hi << 8)) + y);
+        }
+        case AM_INDX: {
+            uint8_t zp = (uint8_t)(read(pc++) + x);
+            uint8_t lo = read(zp), hi = read((uint8_t)(zp + 1));
+            return (uint16_t)(lo | (hi << 8));
+        }
+        case AM_INDY: {
+            uint8_t zp = read(pc++);
+            uint8_t lo = read(zp), hi = read((uint8_t)(zp + 1));
+            return (uint16_t)((lo | (hi << 8)) + y);
+        }
+        default:
+            return 0;
+    }
+}
+
+void CPU6502::step() {
+    returned = false;
+    uint8_t op = read(pc++);
+    uint8_t mn = kOpMnemonic[op];
+    uint8_t mode = kOpMode[op];
+
+    switch (mn) {
+        case OP_BRK:
+            ++pc;
+            push((uint8_t)(pc >> 8)); push((uint8_t)pc);
+            push((uint8_t)(p | FB | FU));
+            p |= FI;
+            pc = (uint16_t)(read(0xFFFE) | (read(0xFFFF) << 8));
+            return;
+        case OP_RTS: {
+            uint8_t lo = pull(), hi = pull();
+            pc = (uint16_t)(((hi << 8) | lo) + 1);
+            returned = true;
+            return;
+        }
+        case OP_RTI: {
+            p = pull();
+            uint8_t lo = pull(), hi = pull();
+            pc = (uint16_t)(lo | (hi << 8));
+            return;
+        }
+        case OP_JSR: {
+            uint16_t target = resolve(AM_ABS);
+            uint16_t ret = (uint16_t)(pc - 1);
+            push((uint8_t)(ret >> 8)); push((uint8_t)ret);
+            pc = target;
+            return;
+        }
+        case OP_JMP:
+            if (mode == AM_ABS) pc = resolve(AM_ABS);
+            else {
+                uint16_t ptr = resolve(AM_ABS);
+                uint8_t lo = read(ptr);
+                uint8_t hi = read((uint16_t)((ptr & 0xFF00) | ((ptr + 1) & 0x00FF)));
+                pc = (uint16_t)(lo | (hi << 8));
+            }
+            return;
+        case OP_BCC: case OP_BCS: case OP_BEQ: case OP_BMI:
+        case OP_BNE: case OP_BPL: case OP_BVC: case OP_BVS: {
+            int8_t off = (int8_t)read(pc++);
+            bool cond = false;
+            switch (mn) {
+                case OP_BCC: cond = (p & FC) == 0; break;
+                case OP_BCS: cond = (p & FC) != 0; break;
+                case OP_BEQ: cond = (p & FZ) != 0; break;
+                case OP_BMI: cond = (p & FN) != 0; break;
+                case OP_BNE: cond = (p & FZ) == 0; break;
+                case OP_BPL: cond = (p & FN) == 0; break;
+                case OP_BVC: cond = (p & FV) == 0; break;
+                case OP_BVS: cond = (p & FV) != 0; break;
+            }
+            if (cond) pc = (uint16_t)(pc + off);
+            return;
+        }
+        case OP_PHA: push(a); return;
+        case OP_PHP: push((uint8_t)(p | FB | FU)); return;
+        case OP_PLA: a = pull(); setzn(a); return;
+        case OP_PLP: p = (uint8_t)((pull() & ~FB) | FU); return;
+        case OP_CLC: p = (uint8_t)(p & ~FC); return;
+        case OP_CLD: p = (uint8_t)(p & ~FD); return;
+        case OP_CLI: p = (uint8_t)(p & ~FI); return;
+        case OP_CLV: p = (uint8_t)(p & ~FV); return;
+        case OP_SEC: p |= FC; return;
+        case OP_SED: p |= FD; return;
+        case OP_SEI: p |= FI; return;
+        case OP_TAX: x = a; setzn(x); return;
+        case OP_TAY: y = a; setzn(y); return;
+        case OP_TSX: x = s; setzn(x); return;
+        case OP_TXA: a = x; setzn(a); return;
+        case OP_TXS: s = x; return;
+        case OP_TYA: a = y; setzn(a); return;
+        case OP_DEX: --x; setzn(x); return;
+        case OP_DEY: --y; setzn(y); return;
+        case OP_INX: ++x; setzn(x); return;
+        case OP_INY: ++y; setzn(y); return;
+        case OP_NOP: (void)resolve(mode); return;
+        default: break;
+    }
+
+    uint16_t addr = resolve(mode);
+    uint8_t v = read(addr);
+
+    switch (mn) {
+        case OP_LDA: a = v; setzn(a); break;
+        case OP_LDX: x = v; setzn(x); break;
+        case OP_LDY: y = v; setzn(y); break;
+        case OP_STA: write(addr, a); break;
+        case OP_STX: write(addr, x); break;
+        case OP_STY: write(addr, y); break;
+        case OP_ORA: a |= v; setzn(a); break;
+        case OP_AND: a &= v; setzn(a); break;
+        case OP_EOR: a ^= v; setzn(a); break;
+        case OP_ADC: adc(v); break;
+        case OP_SBC: sbc(v); break;
+        case OP_CMP: cmp(a, v); break;
+        case OP_CPX: cmp(x, v); break;
+        case OP_CPY: cmp(y, v); break;
+        case OP_BIT:
+            setzn((uint8_t)(a & v));
+            setv((v & 0x40) != 0);
+            p = (uint8_t)((p & ~FN) | (v & FN));
+            break;
+        case OP_ASL: {
+            uint8_t t = (mode == AM_ACC) ? a : v;
+            setc((t & 0x80) != 0); t <<= 1; setzn(t);
+            if (mode == AM_ACC) a = t; else write(addr, t);
+            break;
+        }
+        case OP_LSR: {
+            uint8_t t = (mode == AM_ACC) ? a : v;
+            setc((t & 1) != 0); t >>= 1; setzn(t);
+            if (mode == AM_ACC) a = t; else write(addr, t);
+            break;
+        }
+        case OP_ROL: {
+            uint8_t t = (mode == AM_ACC) ? a : v;
+            uint8_t c = (p & FC) ? 1 : 0;
+            setc((t & 0x80) != 0);
+            t = (uint8_t)((t << 1) | c); setzn(t);
+            if (mode == AM_ACC) a = t; else write(addr, t);
+            break;
+        }
+        case OP_ROR: {
+            uint8_t t = (mode == AM_ACC) ? a : v;
+            uint8_t c = (p & FC) ? 0x80 : 0;
+            setc((t & 1) != 0);
+            t = (uint8_t)((t >> 1) | c); setzn(t);
+            if (mode == AM_ACC) a = t; else write(addr, t);
+            break;
+        }
+        case OP_INC: { uint8_t t = (uint8_t)(v + 1); write(addr, t); setzn(t); break; }
+        case OP_DEC: { uint8_t t = (uint8_t)(v - 1); write(addr, t); setzn(t); break; }
+        case OP_LAX: a = x = v; setzn(a); break;
+        case OP_SAX: write(addr, (uint8_t)(a & x)); break;
+        case OP_DCP: { uint8_t t = (uint8_t)(v - 1); write(addr, t); cmp(a, t); break; }
+        case OP_ISC: { uint8_t t = (uint8_t)(v + 1); write(addr, t); sbc(t); break; }
+        case OP_SLO: {
+            setc((v & 0x80) != 0);
+            uint8_t t = (uint8_t)(v << 1); write(addr, t);
+            a |= t; setzn(a);
+            break;
+        }
+        case OP_RLA: {
+            uint8_t c = (p & FC) ? 1 : 0;
+            setc((v & 0x80) != 0);
+            uint8_t t = (uint8_t)((v << 1) | c); write(addr, t);
+            a &= t; setzn(a);
+            break;
+        }
+        case OP_SRE: {
+            setc((v & 1) != 0);
+            uint8_t t = (uint8_t)(v >> 1); write(addr, t);
+            a ^= t; setzn(a);
+            break;
+        }
+        case OP_RRA: {
+            uint8_t c = (p & FC) ? 0x80 : 0;
+            setc((v & 1) != 0);
+            uint8_t t = (uint8_t)((v >> 1) | c); write(addr, t);
+            adc(t);
+            break;
+        }
+        case OP_ANC: a &= v; setzn(a); setc((a & 0x80) != 0); break;
+        case OP_ALR: a &= v; setc((a & 1) != 0); a >>= 1; setzn(a); break;
+        case OP_ARR: {
+            a &= v;
+            uint8_t c = (p & FC) ? 0x80 : 0;
+            a = (uint8_t)((a >> 1) | c);
+            setzn(a);
+            setc((a & 0x40) != 0);
+            setv(((a & 0x40) != 0) ^ ((a & 0x20) != 0));
+            break;
+        }
+        case OP_SBX: {
+            unsigned t = (unsigned)(a & x) - v;
+            setc((a & x) >= v);
+            x = (uint8_t)t; setzn(x);
+            break;
+        }
+        case OP_AHX: write(addr, (uint8_t)(a & x & ((addr >> 8) + 1))); break;
+        case OP_SHX: write(addr, (uint8_t)(x & ((addr >> 8) + 1))); break;
+        case OP_SHY: write(addr, (uint8_t)(y & ((addr >> 8) + 1))); break;
+        case OP_TAS:
+            s = (uint8_t)(a & x);
+            write(addr, (uint8_t)(s & ((addr >> 8) + 1)));
+            break;
+        case OP_LAS: a = x = s = (uint8_t)(v & s); setzn(a); break;
+        case OP_XAA: a = (uint8_t)((a | x) & v); setzn(a); break;
+        default: break;
+    }
+}
+
+bool CPU6502::call(uint16_t addr, int maxInstr) {
+    uint8_t base = s;
+    push(0xFF); push(0xFF);
+    pc = addr;
+    for (int i = 0; i < maxInstr; ++i) {
+        step();
+        if (jam) return false;
+        if (returned && s == base) return true;
+    }
+    return false;
+}
+
+
+// ---------------------------------------------------------------------------
+// GBS: cartucho GB sintetico con el stub que llama a init/play.
+// ---------------------------------------------------------------------------
+struct GbsInfo {
+    int version = 0, totalSongs = 0, firstSong = 1;
+    uint16_t loadAddr = 0x400, initAddr = 0, playAddr = 0, stackPtr = 0xFFFE;
+    uint8_t timerModulo = 0, timerControl = 0;
+    std::string title, author, copyright;
+};
+
+static void GbsReadString(const std::vector<uint8_t>& d, size_t off, size_t n, std::string& out) {
+    out.clear();
+    for (size_t i = 0; i < n && off + i < d.size(); ++i) {
+        uint8_t c = d[off + i];
+        if (c == 0) break;
+        out.push_back((c >= 32 && c < 127) ? (char)c : ' ');
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+}
+
+static bool GbsParse(const std::vector<uint8_t>& d, GbsInfo& info) {
+    if (d.size() < 0x70 || memcmp(d.data(), "GBS", 3) != 0) return false;
+    info.version = d[0x03];
+    info.totalSongs = d[0x04];
+    if (info.totalSongs <= 0) info.totalSongs = 1;
+    info.firstSong = d[0x05] ? d[0x05] : 1;
+    info.loadAddr = (uint16_t)(d[0x06] | (d[0x07] << 8));
+    info.initAddr = (uint16_t)(d[0x08] | (d[0x09] << 8));
+    info.playAddr = (uint16_t)(d[0x0A] | (d[0x0B] << 8));
+    info.stackPtr = (uint16_t)(d[0x0C] | (d[0x0D] << 8));
+    if (info.stackPtr < 0xC000) info.stackPtr = 0xFFFE;
+    info.timerModulo = d[0x0E];
+    info.timerControl = d[0x0F];
+    GbsReadString(d, 0x10, 32, info.title);
+    GbsReadString(d, 0x30, 32, info.author);
+    GbsReadString(d, 0x50, 32, info.copyright);
+    return true;
+}
+
+// Construye un ROM de 32 KiB: stub en 0x150, handler del timer en 0x190 y los
+// datos del GBS en loadAddr (>= 0x200 para no pisar el stub).
+static bool GbsBuildRom(const std::vector<uint8_t>& gbs, int track, std::vector<uint8_t>& out) {
+    GbsInfo info;
+    if (!GbsParse(gbs, info)) return false;
+    size_t dataLen = gbs.size() - 0x70;
+    if (info.loadAddr < 0x200 || info.loadAddr + dataLen > 0x8000) return false;
+    out.assign(0x8000, 0xFF);
+    memcpy(out.data() + info.loadAddr, gbs.data() + 0x70, dataLen);
+
+    // Cabecera de cartucho DMG (sin boot ROM, no hace falta el logo).
+    memset(out.data() + 0x104, 0, 0x40);
+    memcpy(out.data() + 0x134, "GBS PLAYER", 10);
+    out[0x143] = 0x00;   // DMG
+    out[0x147] = 0x00;   // ROM only
+    out[0x148] = 0x00;   // 32 KiB
+    out[0x149] = 0x00;   // sin RAM
+
+    // Vectores de interrupcion.
+    out[0x40] = 0xD9;    // VBlank: RETI
+    out[0x48] = 0xD9;    // STAT: RETI
+    out[0x50] = 0xD9;    // Timer: RETI (se cambia si hay play)
+    out[0x58] = 0xD9;    // Serial: RETI
+    out[0x60] = 0xD9;    // Joypad: RETI
+
+    const uint16_t stub = 0x150;
+    const uint16_t handler = 0x190;
+    out[0x100] = 0xC3;
+    out[0x101] = (uint8_t)(stub & 0xFF);
+    out[0x102] = (uint8_t)(stub >> 8);
+
+    uint16_t p = stub;
+    auto put = [&](uint8_t b) { out[p++] = b; };
+    put(0xF3);                                     // DI
+    put(0x31); put((uint8_t)(info.stackPtr & 0xFF)); put((uint8_t)(info.stackPtr >> 8));
+    put(0x01); put(0x00); put(0x00);               // LD BC,0
+    put(0x11); put(0x00); put(0x00);               // LD DE,0
+    put(0x21); put(0x00); put(0x00);               // LD HL,0
+    put(0x3E); put(0x80); put(0xE0); put(0x26);    // NR52 on
+    put(0x3E); put(0xFF); put(0xE0); put(0x25);    // NR51
+    put(0x3E); put(0x77); put(0xE0); put(0x24);    // NR50
+    if (info.initAddr) {
+        put(0x3E); put((uint8_t)track);            // LD A,track
+        put(0xCD); put((uint8_t)(info.initAddr & 0xFF)); put((uint8_t)(info.initAddr >> 8));
+    }
+    // Sonido on tras init (algunos GBs lo apagan durante la inicializacion).
+    put(0x3E); put(0x80); put(0xE0); put(0x26);
+    put(0x3E); put(0xFF); put(0xE0); put(0x25);
+    put(0x3E); put(0x77); put(0xE0); put(0x24);
+
+    if (info.playAddr) {
+        uint8_t tma = info.timerControl ? info.timerModulo : 188;
+        uint8_t tac = info.timerControl ? (uint8_t)(info.timerControl | 0x04) : 0x04;
+        put(0x3E); put(tma); put(0xE0); put(0x06); // TMA
+        put(0x3E); put(tac); put(0xE0); put(0x07); // TAC
+        put(0x3E); put(0x04); put(0xE0); put(0xFF); // IE = timer
+        // Vector del timer: JP handler.
+        out[0x50] = 0xC3;
+        out[0x51] = (uint8_t)(handler & 0xFF);
+        out[0x52] = (uint8_t)(handler >> 8);
+        // handler: PUSH AF/BC/DE/HL; CALL play; POP HL/DE/BC/AF; RETI
+        uint16_t q = handler;
+        auto hput = [&](uint8_t b) { out[q++] = b; };
+        hput(0xF5); hput(0xC5); hput(0xD5); hput(0xE5);
+        hput(0xCD); hput((uint8_t)(info.playAddr & 0xFF)); hput((uint8_t)(info.playAddr >> 8));
+        hput(0xE1); hput(0xD1); hput(0xC1); hput(0xF1);
+        hput(0xD9);
+    }
+    put(0xFB);                                      // EI
+    put(0x76);                                      // HALT
+    put(0x18); put(0xFD);                           // JR -3
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Estado del reproductor de musica (GBS/NSF).
+// ---------------------------------------------------------------------------
+enum { PLAYER_NONE = 0, PLAYER_GBS = 1, PLAYER_NSF = 2 };
+struct MusicPlayerState {
+    int type = PLAYER_NONE;
+    int total = 0, track = 1;
+    std::string title, author, copyright;
+    std::vector<uint8_t> file;
+    bool active = false;
+};
+static MusicPlayerState g_player;
+static NsfPlayer g_nsf;
+static bool g_player_pace_reset = false;
+
+// ============================================================================
 // [v0.10.0] Link Cable (puerto serie por memoria compartida).
 //
 // El Game Boy enlaza por el puerto serie (SB/SC, 0xFF01/0xFF02). Este emulador
@@ -816,6 +1866,9 @@ public:
 
     // ------------------------------------------------------------ CGB
     bool isCgbMode = false;
+    // GBS: el cartucho sintetico debe arrancar siempre como DMG normal, sin la
+    // firma SGB, aunque el usuario tenga seleccionado un modo SGB/CGB.
+    bool forceDmgMode = false;
     uint8_t vbk = 0, svbk = 0, key1Armed = 0, opri = 0;
     uint8_t ff72 = 0, ff73 = 0, ff74 = 0, ff75 = 0;
     bool cgbDoubleSpeed = false;
@@ -1014,6 +2067,13 @@ public:
         std::ifstream fi(path, std::ios::binary);
         if (!fi) return false;
         std::vector<uint8_t> data((std::istreambuf_iterator<char>(fi)), std::istreambuf_iterator<char>());
+        return loadRomFromData(std::move(data), false);
+    }
+
+    // Carga una imagen de cartucho ya en memoria (la usa el reproductor GBS
+    // para montar un ROM sintetico con su stub de init/play).
+    bool loadRomFromData(std::vector<uint8_t> data, bool forceDmg) {
+        forceDmgMode = forceDmg;
         if (data.size() < 0x150) return false;
         size_t sz = 0x8000;
         while (sz < data.size()) sz <<= 1;
@@ -1047,8 +2107,12 @@ public:
         // fuerce. Los modos SGB basados en DMG (Super Game Boy y
         // Game Boy + SGB Border) deben arrancar en modo DMG para que el juego
         // detecte el hardware SGB (firma C=0x14) y envie su borde.
-        if (g_model_pref == SYS_DMG || ModeIsSgb(g_model_pref)) isCgbMode = false;
-        else if (ModeForcesCgb(g_model_pref)) isCgbMode = true;
+        // Los modos CGB+SGB solo fuerzan CGB en cartuchos CGB: un juego DMG
+        // arrancado como CGB usa las paletas CGB (blancas sin boot ROM) y se
+        // queda en pantalla blanca. Para esos juegos se usa DMG+SGB.
+        if (forceDmg) isCgbMode = false;
+        else if (g_model_pref == SYS_DMG || ModeIsSgb(g_model_pref)) isCgbMode = false;
+        else if (ModeForcesCgb(g_model_pref)) isCgbMode = (rom[0x143] & 0x80) != 0;
         else isCgbMode = (rom[0x143] & 0x80) != 0;
         ext_ram.fill(0xFF);
         reset();
@@ -1064,9 +2128,10 @@ public:
         else { a = 0x01; f = 0xB0; b = 0x00; c = 0x13; d = 0x00; e = 0xD8; h = 0x01; l = 0x4D; }
         // Firma de arranque: C=0x14 anuncia un Super Game Boy (SGB/SGB2) y hace
         // que el juego habilite sus funciones SGB (y envie su borde). Los modos
-        // DMG+SGB la exponen siempre; los modos CGB+SGB la piden solo durante la
-        // captura del borde (la partida real conserva C=0x00 y su color CGB).
-        if (sgbSignatureMode || (!isCgbMode && ModeIsSgb(g_model_pref))) c = 0x14;
+        // DMG+SGB la exponen siempre; en los modos CGB+SGB la partida CGB
+        // conserva C=0x00, pero un cartucho DMG corre como DMG+SGB y tambien la
+        // recibe (igual que durante la captura del borde).
+        if (!forceDmgMode && (sgbSignatureMode || (!isCgbMode && ModeUsesBorder(g_model_pref)))) c = 0x14;
         pc = 0x100; sp = 0xFFFE;
         ime = imeEnablePending = halted = haltBugPending = false;
         divCounter = isCgbMode ? 0x1EA0 : 0xABCC;
@@ -2898,11 +3963,14 @@ bool CapturarBordeSgbParaCgb() {
 }
 
 // Prepara el borde para el modo pedido. En los modos DMG+SGB el juego lo envia
-// por si mismo al arrancar; en los modos CGB+SGB se captura de antemano.
+// por si mismo al arrancar; en los modos CGB+SGB se captura de antemano, pero
+// solo para cartuchos CGB (un cartucho DMG ya corre como DMG+SGB y envia su
+// propio borde).
 void PrepararBordeParaModo(int mode) {
     g_sgb_captured_count = 0;
     g_sgb_capture_pending = false;
-    if (mode == SYS_GBC_SGB || mode == SYS_GBC_INIT_SGB) {
+    bool cgbCart = !g_bus.rom.empty() && g_bus.rom.size() > 0x143 && (g_bus.rom[0x143] & 0x80);
+    if ((mode == SYS_GBC_SGB || mode == SYS_GBC_INIT_SGB) && (g_bus.rom.empty() || cgbCart)) {
         if (!g_bus.rom.empty()) {
             if (!CapturarBordeSgbParaCgb()) g_sgb_capture_pending = true;
         } else {
@@ -2979,6 +4047,21 @@ static int g_waveHdrIdx = 0;
 static HWAVEOUT g_hWaveOut = NULL;
 static bool g_waveOutReady = false;
 
+// Fuente de audio activa: por defecto la APU de Game Boy; al reproducir un NSF
+// se apunta a la APU de NES. EnviarFrameAudio() lee siempre de esta fuente.
+static int16_t* g_audio_ext_buf = nullptr;
+static int* g_audio_ext_count = nullptr;
+static inline int16_t* AudioSampleBuf() {
+    return g_audio_ext_buf ? g_audio_ext_buf : g_bus.apu.sampleBuf;
+}
+static inline int& AudioSampleCount() {
+    return g_audio_ext_count ? *g_audio_ext_count : g_bus.apu.sampleCount;
+}
+static inline void ResetAudioSamples() {
+    g_bus.apu.sampleCount = 0;
+    if (g_audio_ext_count) *g_audio_ext_count = 0;
+}
+
 void IniciarAudio(HWND hWnd) {
     WAVEFORMATEX wfx = {};
     wfx.wFormatTag = WAVE_FORMAT_PCM;
@@ -3044,9 +4127,9 @@ void CerrarAudio() {
 }
 
 void EnviarFrameAudio() {
-    if (!g_waveOutReady || !g_audio_enabled || g_speedup_audio_muted) { g_bus.apu.sampleCount = 0; return; }
+    if (!g_waveOutReady || !g_audio_enabled || g_speedup_audio_muted) { ResetAudioSamples(); return; }
 
-    int n = g_bus.apu.sampleCount;   // samples estéreo totales (L+R ya contados)
+    int n = AudioSampleCount();   // samples estéreo totales (L+R ya contados)
     if (n <= 0) return;
     if (n > WAVE_BUF_INTS) n = WAVE_BUF_INTS;
 
@@ -3061,7 +4144,7 @@ void EnviarFrameAudio() {
         }
     }
     if (!hdr) {
-        g_bus.apu.sampleCount = 0;
+        ResetAudioSamples();
         return;
     }
 
@@ -3072,10 +4155,10 @@ void EnviarFrameAudio() {
         int pendientes = 0;
         for (int i = 0; i < WAVE_HDRS; ++i)
             if (!(g_waveHdrs[i].dwFlags & WHDR_DONE)) pendientes++;
-        if (pendientes > 2) { g_bus.apu.sampleCount = 0; return; }
+        if (pendientes > 2) { ResetAudioSamples(); return; }
     }
 
-    memcpy(g_waveBufs[idx], g_bus.apu.sampleBuf, n * sizeof(int16_t));
+    memcpy(g_waveBufs[idx], AudioSampleBuf(), n * sizeof(int16_t));
     g_audio_fx.process(g_waveBufs[idx], n);
 
     hdr->dwBufferLength = n * sizeof(int16_t);
@@ -3085,7 +4168,7 @@ void EnviarFrameAudio() {
     waveOutWrite(g_hWaveOut, hdr, sizeof(WAVEHDR));
 
     g_waveHdrIdx = (idx + 1) % WAVE_HDRS;
-    g_bus.apu.sampleCount = 0;
+    ResetAudioSamples();
 }
 
 // ============================================================================
@@ -3250,6 +4333,7 @@ void CrearMenusExtra(HWND hWnd) {
 }
 
 void GuardarSramCartucho() {
+    if (g_player.type != PLAYER_NONE) return;
     if (!g_rom_loaded || !g_bus.hasBattery) return;
     if (g_bus.ramSize == 0 && !g_bus.hasRtc) return;
     CreateDirectoryA(".\\gbsave", NULL);
@@ -3262,6 +4346,7 @@ void GuardarSramCartucho() {
 }
 
 void CargarSramCartucho() {
+    if (g_player.type != PLAYER_NONE) return;
     if (!g_rom_loaded) return;
     char szPath[MAX_PATH];
     wsprintfA(szPath, ".\\gbsave\\%s.sav", g_rom_base_name);
@@ -3422,6 +4507,15 @@ INT_PTR CALLBACK KeySettingProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ResizeEmulatorWindow(HWND hWnd, int scale) {
+    if (g_player.type != PLAYER_NONE) {
+        RECT prc = {0, 0, 384, 216};
+        AdjustWindowRect(&prc, WS_OVERLAPPEDWINDOW, TRUE);
+        SetWindowPos(hWnd, NULL, 0, 0, prc.right - prc.left, prc.bottom - prc.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(hWnd, NULL, TRUE);
+        UpdateWindow(hWnd);
+        return;
+    }
     int mag = kFilterMag[g_video_filter >= 0 && g_video_filter < FILTER_COUNT ? g_video_filter : FILTER_NONE];
     int w = (g_sgb_border_active ? SGB_W : GB_WIDTH) * mag;
     int h = (g_sgb_border_active ? SGB_H : GB_HEIGHT) * mag;
@@ -3449,10 +4543,13 @@ void ActualizarEstadoMenusArchivo(HWND hWnd) {
 }
 
 void ActualizarTituloVentana(HWND hWnd);
+static void PlayerStop();
+static void PlayerSetTrack(HWND hWnd, int track, bool wrap);
 
 void LiberarRomActual(HWND hWnd) {
     if (!g_rom_loaded) return;
     GuardarSramCartucho();
+    PlayerStop();
     g_bus.rom.clear();
     g_rom_loaded = false;
     g_emulation_paused = false;
@@ -3460,6 +4557,7 @@ void LiberarRomActual(HWND hWnd) {
     g_sgb_captured_count = 0;
     g_sgb_capture_pending = false;
     for (int i = 0; i < GB_WIDTH * GB_HEIGHT; ++i) g_screenBuffer[i] = 0;
+    ResizeEmulatorWindow(hWnd, g_window_scale);
     ActualizarEstadoMenusArchivo(hWnd);
     ActualizarTituloVentana(hWnd);
     InvalidateRect(hWnd, NULL, TRUE);
@@ -3469,6 +4567,10 @@ void LiberarRomActual(HWND hWnd) {
 
 void ResetearEmulador(HWND hWnd) {
     if (!g_rom_loaded) return;
+    if (g_player.type != PLAYER_NONE) {
+        PlayerSetTrack(hWnd, g_player.track, false);
+        return;
+    }
     // El reset no toca ext_ram: ahí vive el save del cartucho.
     g_bus.reset();
     memcpy(g_screenBuffer, g_bus.frameBuf, sizeof(g_screenBuffer));
@@ -3488,10 +4590,15 @@ void AlternarPausaEmulador(HWND hWnd) {
 // tambien desde el bucle principal (contador de FPS).
 void ActualizarTituloVentana(HWND hWnd) {
     char titulo[MAX_PATH * 2];
-    if (g_rom_display_name[0])
+    if (g_player.type != PLAYER_NONE) {
+        wsprintfA(titulo, "%s - %s - Music No.%d/%d", g_window_base_title,
+                  g_player.title.empty() ? "Player" : g_player.title.c_str(),
+                  g_player.track, g_player.total > 0 ? g_player.total : 1);
+    } else if (g_rom_display_name[0]) {
         wsprintfA(titulo, "%s - %s", g_window_base_title, g_rom_display_name);
-    else
+    } else {
         lstrcpyA(titulo, g_window_base_title);
+    }
     SetWindowTextA(hWnd, titulo);
 }
 
@@ -3519,8 +4626,212 @@ void EstablecerNombreRom(const char* szFile) {
     if (dot) *dot = '\0';
 }
 
-bool CargarRomDesdeRuta(HWND hWnd, const char* szFile) {
+// ============================================================================
+// [v1.1.0] Reproductor de musica GBS/NSF: carga, cambio de pista y dibujo.
+// ============================================================================
+static bool EsArchivoMusica(const char* path, int& type) {
+    std::ifstream f(path, std::ios::binary);
+    unsigned char magic[5] = {0};
+    if (f) f.read((char*)magic, 4);
+    if (magic[0] == 'G' && magic[1] == 'B' && magic[2] == 'S') { type = PLAYER_GBS; return true; }
+    if (magic[0] == 'N' && magic[1] == 'E' && magic[2] == 'S' && magic[3] == 'M') { type = PLAYER_NSF; return true; }
+    const char* dot = strrchr(path, '.');
+    if (dot) {
+        char ext[8] = {0};
+        for (int i = 0; i < 7 && dot[1 + i]; ++i) {
+            char c = dot[1 + i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            ext[i] = c;
+        }
+        if (!strcmp(ext, "gbs")) { type = PLAYER_GBS; return true; }
+        if (!strcmp(ext, "nsf")) { type = PLAYER_NSF; return true; }
+    }
+    return false;
+}
+
+static void PlayerDetachAudio() {
+    g_audio_ext_buf = nullptr;
+    g_audio_ext_count = nullptr;
+    ResetAudioSamples();
+}
+
+static void PlayerStop() {
+    g_player.type = PLAYER_NONE;
+    g_player.active = false;
+    g_player.total = 0;
+    g_player.track = 1;
+    g_player.title.clear();
+    g_player.author.clear();
+    g_player.copyright.clear();
+    g_player.file.clear();
+    PlayerDetachAudio();
+    if (g_speedup_rate_active) AplicarTasaSpeedup(false);
+    g_speedup_rate_active = false;
+    g_speedup_audio_muted = false;
+    if (g_hWaveOut) waveOutReset(g_hWaveOut);
+}
+
+static bool PlayerStartGbsTrack(int track) {
+    if (g_player.type != PLAYER_GBS || g_player.file.empty()) return false;
+    GbsInfo info;
+    if (!GbsParse(g_player.file, info)) return false;
+    int total = info.totalSongs > 0 ? info.totalSongs : 1;
+    if (track < 1) track = 1;
+    if (track > total) track = total;
+    std::vector<uint8_t> rom;
+    if (!GbsBuildRom(g_player.file, track, rom)) return false;
+    if (!g_bus.loadRomFromData(std::move(rom), true)) return false;
+    g_player.track = track;
+    g_player.total = total;
+    g_audio_ext_buf = nullptr;
+    g_audio_ext_count = nullptr;
+    g_bus.apu.sampleCount = 0;
+    if (g_hWaveOut) waveOutReset(g_hWaveOut);
+    return true;
+}
+
+static bool PlayerStartNsfTrack(int track) {
+    if (g_player.type != PLAYER_NSF || g_player.file.empty()) return false;
+    int total = g_player.total > 0 ? g_player.total : 1;
+    if (track < 1) track = 1;
+    if (track > total) track = total;
+    if (!g_nsf.startSong(track)) return false;
+    g_player.track = track;
+    g_audio_ext_buf = g_nsf.apu.sampleBuf;
+    g_audio_ext_count = &g_nsf.apu.sampleCount;
+    g_nsf.apu.sampleCount = 0;
+    if (g_hWaveOut) waveOutReset(g_hWaveOut);
+    return true;
+}
+
+static void PlayerSetTrack(HWND hWnd, int track, bool wrap) {
+    if (g_player.type == PLAYER_NONE) return;
+    int total = g_player.total > 0 ? g_player.total : 1;
+    if (track < 1) track = wrap ? total : 1;
+    if (track > total) track = wrap ? 1 : total;
+    bool ok = (g_player.type == PLAYER_GBS) ? PlayerStartGbsTrack(track) : PlayerStartNsfTrack(track);
+    if (!ok) return;
+    g_emulation_paused = false;
+    ActualizarEstadoMenusArchivo(hWnd);
+    ActualizarTituloVentana(hWnd);
+    InvalidateRect(hWnd, NULL, TRUE);
+    UpdateWindow(hWnd);
+    g_player_pace_reset = true;
+}
+
+static void PlayerNextTrack(HWND hWnd) { PlayerSetTrack(hWnd, g_player.track + 1, true); }
+static void PlayerPrevTrack(HWND hWnd) { PlayerSetTrack(hWnd, g_player.track - 1, true); }
+
+static void PlayerDraw(HDC hdc, const RECT& rc) {
+    FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    int W = rc.right - rc.left, H = rc.bottom - rc.top;
+    if (W < 32 || H < 32) return;
+    int fontH = H / 9;
+    int byWidth = W / 16;
+    if (byWidth < fontH) fontH = byWidth;
+    if (fontH < 8) fontH = 8;
+    static HFONT playerFont = NULL;
+    static int playerFontH = 0;
+    if (!playerFont || playerFontH != fontH) {
+        if (playerFont) DeleteObject(playerFont);
+        playerFont = CreateFontA(fontH, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            DEFAULT_PITCH | FF_MODERN, "Consolas");
+        playerFontH = fontH;
+    }
+    HGDIOBJ oldFont = SelectObject(hdc, playerFont);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 0, 0));
+    int margin = W / 24;
+    if (margin < 4) margin = 4;
+    const char* kind = (g_player.type == PLAYER_NSF) ? "NSF Player Test version"
+                                                     : "GBS Player Test version";
+    TextOutA(hdc, margin, H / 10, kind, (int)strlen(kind));
+    std::string title = g_player.title;
+    if (title.empty()) title = (g_player.type == PLAYER_NSF) ? "NSF Player" : "GBS Player";
+    TextOutA(hdc, margin, H * 4 / 10, title.c_str(), (int)title.size());
+    char line[128];
+    wsprintfA(line, "Music No.%d/%d", g_player.track, g_player.total > 0 ? g_player.total : 1);
+    TextOutA(hdc, margin, H * 7 / 10, line, (int)strlen(line));
+    SelectObject(hdc, oldFont);
+}
+
+static bool CargarMusicaDesdeRuta(HWND hWnd, const char* szFile, int type) {
+    std::ifstream f(szFile, std::ios::binary);
+    if (!f) {
+        MessageBoxA(hWnd, "No se pudo abrir el archivo.", "Rew. Reborn", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (g_rom_loaded) GuardarSramCartucho();
+    PlayerStop();
+    g_rom_loaded = false;
+    g_player.type = type;
+    g_player.file = std::move(data);
+
+    bool ok = false;
+    if (type == PLAYER_GBS) {
+        GbsInfo info;
+        if (!GbsParse(g_player.file, info)) {
+            MessageBoxA(hWnd, "No se pudo leer el archivo GBS.", "Rew. Reborn", MB_OK | MB_ICONERROR);
+            PlayerStop();
+            return false;
+        }
+        g_player.total = info.totalSongs;
+        g_player.title = info.title.empty() ? "GBS Player" : info.title;
+        g_player.author = info.author;
+        g_player.copyright = info.copyright;
+        g_player.track = info.firstSong;
+        ok = PlayerStartGbsTrack(info.firstSong);
+    } else {
+        if (!g_nsf.load(g_player.file)) {
+            MessageBoxA(hWnd, "No se pudo leer el archivo NSF.", "Rew. Reborn", MB_OK | MB_ICONERROR);
+            PlayerStop();
+            return false;
+        }
+        g_player.total = g_nsf.totalSongs;
+        g_player.title = g_nsf.title.empty() ? "NSF Player" : g_nsf.title;
+        g_player.author = g_nsf.author;
+        g_player.copyright = g_nsf.copyright;
+        g_player.track = g_nsf.firstSong;
+        ok = PlayerStartNsfTrack(g_nsf.firstSong);
+    }
+    if (!ok) {
+        MessageBoxA(hWnd, "No se pudo iniciar la reproduccion.", "Rew. Reborn", MB_OK | MB_ICONERROR);
+        PlayerStop();
+        ActualizarEstadoMenusArchivo(hWnd);
+        return false;
+    }
+
+    g_player.active = true;
+    g_rom_loaded = true;
+    g_emulation_paused = false;
+    g_speedup_held = false;
+    lstrcpyA(g_rom_full_path, szFile);
+    const char* file_name = strrchr(szFile, '\\');
+    if (file_name) ++file_name; else file_name = szFile;
+    lstrcpyA(g_rom_base_name, file_name);
+    char* dot = strrchr(g_rom_base_name, '.');
+    if (dot) *dot = '\0';
+    lstrcpynA(g_rom_display_name, g_player.title.c_str(), MAX_PATH);
+    g_sgb_border_active = false;
+    g_sgb_capture_pending = false;
+    g_sgb_border_checked = true;
+    ResizeEmulatorWindow(hWnd, g_window_scale);
+    for (int i = 0; i < GB_WIDTH * GB_HEIGHT; ++i) g_screenBuffer[i] = 0;
+    ActualizarEstadoMenusArchivo(hWnd);
+    ActualizarTituloVentana(hWnd);
+    RedrawWindow(hWnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+    g_player_pace_reset = true;
+    return true;
+}
+
+bool CargarRomDesdeRuta(HWND hWnd, const char* szFile) {
+    int musicType = PLAYER_NONE;
+    if (EsArchivoMusica(szFile, musicType))
+        return CargarMusicaDesdeRuta(hWnd, szFile, musicType);
+    if (g_rom_loaded) GuardarSramCartucho();
+    PlayerStop();
     if (!g_bus.loadRom(std::string(szFile))) {
         g_rom_loaded = false;
         MessageBoxA(hWnd, "No se pudo cargar la ROM.", "Rew. Reborn", MB_OK | MB_ICONERROR);
@@ -3559,7 +4870,10 @@ void OpenRomDialog(HWND hWnd) {
     ofn.hwndOwner = hWnd;
     ofn.lpstrFile = szFile;
     ofn.nMaxFile = sizeof(szFile);
-    ofn.lpstrFilter = "Game Boy ROMs\0*.gb;*.gbc;*.cgb\0All files\0*.*\0";
+    ofn.lpstrFilter = "Game Boy ROMs y musica\0*.gb;*.gbc;*.cgb;*.gbs;*.nsf\0"
+                      "Game Boy ROMs\0*.gb;*.gbc;*.cgb\0"
+                      "GBS / NSF Music\0*.gbs;*.nsf\0"
+                      "All files\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST;
     if (GetOpenFileNameA(&ofn)) CargarRomDesdeRuta(hWnd, szFile);
 }
@@ -3569,6 +4883,11 @@ void ActualizarMenuDeEstados(HWND hWnd) {
     if (!hMenu) return;
     HMENU hStateMenu = GetSubMenu(hMenu, 1);
     if (!hStateMenu) return;
+    UINT estado = (g_rom_loaded && g_player.type == PLAYER_NONE) ? MF_ENABLED : MF_GRAYED;
+    EnableMenuItem(hStateMenu, ID_STATE_SAVE, MF_BYCOMMAND | estado);
+    EnableMenuItem(hStateMenu, ID_STATE_LOAD, MF_BYCOMMAND | estado);
+    for (int i = 0; i < 10; ++i)
+        EnableMenuItem(hStateMenu, 40008 + i, MF_BYCOMMAND | estado);
     char szPath[MAX_PATH];
     char szMenuText[80];
     for (int i = 0; i < 10; ++i) {
@@ -3635,6 +4954,11 @@ bool loadStateFromFile(const std::string& path) {
 
 void EjecutarSaveState(HWND hWnd) {
     if (!g_rom_loaded) return;
+    if (g_player.type != PLAYER_NONE) {
+        MessageBoxA(hWnd, "Los save states no estan disponibles en el reproductor de musica.",
+                    "Rew. Reborn", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
     CreateDirectoryA(".\\gbsave", NULL);
     char szPath[MAX_PATH];
     wsprintfA(szPath, ".\\gbsave\\%s.st%d", g_rom_base_name, g_active_slot);
@@ -3648,6 +4972,11 @@ void EjecutarSaveState(HWND hWnd) {
 
 void EjecutarLoadState(HWND hWnd) {
     if (!g_rom_loaded) return;
+    if (g_player.type != PLAYER_NONE) {
+        MessageBoxA(hWnd, "Los save states no estan disponibles en el reproductor de musica.",
+                    "Rew. Reborn", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
     char szPath[MAX_PATH];
     wsprintfA(szPath, ".\\gbsave\\%s.st%d", g_rom_base_name, g_active_slot);
     if (!loadStateFromFile(std::string(szPath))) {
@@ -3687,8 +5016,24 @@ bool EsComandoMenu(HWND hWnd, UINT commandId, const char* wantedText) {
 
 void MostrarAcercaDe(HWND hWnd) {
     MessageBoxA(hWnd,
-        "Rew. Reborn v1.0.0\n"
+        "Rew. Reborn v1.1.0\n"
         "Emulador Game Boy / Game Boy Color\n\n"
+        "Novedades v1.1.0:\n"
+        "- Reproductor de musica GBS (Game Boy Sound)\n"
+        "  y NSF (NES Sound Format)\n"
+        "- Los .gbs/.nsf se abren desde File > Load Rom\n"
+        "  igual que una ROM de GB/GBC\n"
+        "- GBS: cartucho GB sintetico con stub que llama\n"
+        "  a init/play desde la interrupcion del timer\n"
+        "- NSF: CPU 6502 (2A03) y APU de NES emuladas\n"
+        "  (2 pulsos, triangulo, ruido y DMC)\n"
+        "- Al reproducir se muestra el titulo y\n"
+        "  \"Music No.X/N\" en rojo sobre fondo negro\n"
+        "- Flecha izquierda/derecha: pista anterior/siguiente\n"
+        "- Corregida la pantalla blanca de los juegos DMG\n"
+        "  (p. ej. Medarot Card Robottle) en los modos\n"
+        "  Game Boy Color + SGB Border: ahora corren como\n"
+        "  DMG+SGB con su propio borde\n\n"
         "Novedades v1.0.0 (estable):\n"
         "- RTC MBC3 reescrita con la semantica binaria\n"
         "  real del chip (envoltura 63/63/31 y acarreo\n"
@@ -3797,6 +5142,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_KEYDOWN: {
             if ((static_cast<uint32_t>(lp) & (1u << 30)) != 0) break;
             uint32_t vk = (uint32_t)wp;
+            if (g_player.type != PLAYER_NONE) {
+                if (vk == VK_LEFT) { PlayerPrevTrack(hWnd); return 0; }
+                if (vk == VK_RIGHT) { PlayerNextTrack(hWnd); return 0; }
+                break;
+            }
             for (int a = 0; a < MAX_ACTIONS; ++a)
                 for (int c = 0; c < 4; ++c)
                     if (g_bindings[a][c] == vk && vk != 0) {
@@ -3808,6 +5158,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case WM_KEYUP: {
+            if (g_player.type != PLAYER_NONE) break;
             uint32_t vk = (uint32_t)wp;
             for (int a = 0; a < MAX_ACTIONS; ++a)
                 for (int c = 0; c < 4; ++c)
@@ -4014,6 +5365,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = BeginPaint(hWnd, &ps);
             RECT cr;
             GetClientRect(hWnd, &cr);
+            if (g_player.type != PLAYER_NONE) {
+                PlayerDraw(hdc, cr);
+                EndPaint(hWnd, &ps);
+                break;
+            }
             SetStretchBltMode(hdc, COLORONCOLOR);
             bool useFilter = (g_video_filter != FILTER_NONE) && g_displayW > 0 && g_displayH > 0;
             int srcW = useFilter ? g_displayW : (g_sgb_border_active ? SGB_W : GB_WIDTH);
@@ -4036,6 +5392,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_DESTROY:
             GuardarSramCartucho();
+            PlayerStop();
             GuardarConfiguracionIni();
             CerrarAudio();
 			timeEndPeriod(1);
@@ -4078,6 +5435,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                        ID_VIDEO_X1 + (g_window_scale - 1), MF_BYCOMMAND);
     CrearMenusExtra(hWnd);
 
+    if (lpCmd && lpCmd[0]) {
+        char path[MAX_PATH] = {0};
+        const char* p = lpCmd;
+        while (*p == ' ') ++p;
+        int i = 0;
+        if (*p == '"') {
+            ++p;
+            while (*p && *p != '"' && i < MAX_PATH - 1) path[i++] = *p++;
+        } else {
+            while (*p && *p != ' ' && i < MAX_PATH - 1) path[i++] = *p++;
+        }
+        if (path[0]) CargarRomDesdeRuta(hWnd, path);
+    }
+
     LARGE_INTEGER qpcFreq, lastFrameTime;
     QueryPerformanceFrequency(&qpcFreq);
     QueryPerformanceCounter(&lastFrameTime);
@@ -4093,6 +5464,35 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         } else {
+            if (g_player.type != PLAYER_NONE) {
+                if (!g_emulation_paused) {
+                    if (g_player_pace_reset) {
+                        QueryPerformanceCounter(&lastFrameTime);
+                        g_player_pace_reset = false;
+                    }
+                    if (g_player.type == PLAYER_GBS) g_bus.runFrame();
+                    else g_nsf.runFrame();
+                    EnviarFrameAudio();
+                    InvalidateRect(hWnd, NULL, FALSE);
+                    UpdateWindow(hWnd);
+                    LARGE_INTEGER pnow;
+                    QueryPerformanceCounter(&pnow);
+                    double rate = (g_player.type == PLAYER_NSF) ? g_nsf.frameRateHz
+                                                                : (4194304.0 / 70224.0);
+                    LONGLONG playerTicks = (LONGLONG)(qpcFreq.QuadPart / rate + 0.5);
+                    LONGLONG objetivo = lastFrameTime.QuadPart + playerTicks;
+                    if (pnow.QuadPart < objetivo) {
+                        LONGLONG restante = objetivo - pnow.QuadPart;
+                        DWORD sleepMs = (DWORD)(restante / (qpcFreq.QuadPart / 1000));
+                        if (sleepMs > 2) Sleep(sleepMs - 1);
+                        do { QueryPerformanceCounter(&pnow); } while (pnow.QuadPart < objetivo);
+                    }
+                    lastFrameTime = pnow;
+                } else {
+                    Sleep(10);
+                }
+                continue;
+            }
             if (g_rom_loaded && !g_emulation_paused) {
                 // Speedup: mientras la tecla esta pulsada se ejecutan M frames
                 // por fotograma, pero el ritmo se mantiene estable (objetivo de
@@ -4110,7 +5510,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
                     if (!g_speedup_audio_muted) AplicarTasaSpeedup(false);
                     g_speedup_audio_muted = false;
                     g_speedup_rate_active = false;
-                    g_bus.apu.sampleCount = 0;
+                    ResetAudioSamples();
                     QueryPerformanceCounter(&lastFrameTime);
                 }
                 LONGLONG ticksPerEmuFrame = g_speedup_held

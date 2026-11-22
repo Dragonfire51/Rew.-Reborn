@@ -2,13 +2,13 @@
 
 ## What this repo is
 Win32 Game Boy / Game Boy Color emulator written in a single C++ translation
-unit plus Win32 resources.
+unit plus Win32 resources. It also includes a GBS/NSF music player.
 
 ## Files
 - `Rew. Reborn.cpp` — the entire emulator (M-cycle CPU, PPU, APU, Bus,
   MBC1/2/3(+RTC)/5, CGB WRAM/VRAM banking, save states, waveOut audio,
-  window/menu handling).
-- `resource.h` — header-only `#define`s (icon/menu/dialog IDs, 10 actions x 4
+  GBS/NSF player, window/menu handling).
+- `resource.h` — header-only `#define`s (icon/menu/dialog IDs, 11 actions x 4
   key-binding slots). No includes.
 - `resource.rc` — icon, main menu, key-setting dialog, VERSIONINFO.
 - `app_icon.ico` — 16x16 32bpp icon referenced by `resource.rc`.
@@ -41,7 +41,36 @@ Compiling just the source (`-c`) is a fast syntax check.
   `ProductVersion` strings; both can be patched in place (same byte length).
 - Keep `resource.rc` line endings as CRLF.
 
-## Features (v1.0)
+## Features (v1.1)
+- v1.1.0 adds a GBS/NSF music player. `.gbs` and `.nsf` files are opened from
+  `File > Load Rom` like any GB/GBC ROM (`CargarRomDesdeRuta` dispatches on the
+  magic/extension to `CargarMusicaDesdeRuta`). While a music file plays,
+  `WM_PAINT` draws the title and `Music No.X/N` in red on black
+  (`PlayerDraw`), and Left/Right change track (`PlayerNextTrack` /
+  `PlayerPrevTrack`). The normal emulator key bindings are ignored in this
+  mode. `PlayerStop()` detaches the external audio source and resets waveOut;
+  `GuardarSramCartucho`/`CargarSramCartucho` are no-ops for music files.
+  - GBS: `GbsBuildRom()` builds a synthetic 32 KiB DMG ROM. The stub at 0x150
+    sets up sound, calls `init` with A=track, programs TMA/TAC/IE for the
+    header's timer (or 188/0x04), and halts; the timer vector at 0x50 jumps to
+    a handler at 0x190 that preserves AF/BC/DE/HL, calls `play` and RETIs. The
+    GBS payload is copied at `loadAddr` (must be >= 0x200). It runs on the
+    normal GB core with `forceDmgMode`.
+  - NSF: `NsfPlayer` emulates a 6502 (`CPU6502`, official opcodes plus common
+    illegal ones) and the NES APU (`NesApu`: 2 pulses, triangle, noise, DMC,
+    frame sequencer, non-linear mixer at 44100 Hz). Header layout: magic
+    `NESM\x1A`, load/init/play at 0x08/0x0A/0x0C, strings at 0x0E/0x2E/0x4E,
+    NTSC speed 0x6E, initial banks 0x70..0x77, PAL speed 0x78, flags 0x7A/0x7B.
+    Bank switching is at 0x5FF8..0x5FFF (4 KiB windows); a flat ROM <= 32 KiB
+    is copied to a 64 KiB image at `loadAddr`. `init` gets A=track and X=0/1
+    (NTSC/PAL); `play` is called at the header rate. The APU output is exposed
+    through `g_audio_ext_buf`/`g_audio_ext_count`, so `EnviarFrameAudio` reads
+    it without changes.
+- v1.1.0 also fixes DMG carts forced to CGB in the CGB+SGB modes: they used to
+  render a white screen (the PPU read CGB palettes that start white and the game
+  never writes). `ModeForcesCgb` now only forces CGB when the cart has the CGB
+  flag (`0x143` bit 7); otherwise the game runs DMG+SGB (C=0x14) and sends its
+  own border.
 - v1.0.0 is the first stable release (end of the "alpha" stage). It rewrites
   the MBC3 RTC with the real chip semantics: seconds/minutes/hours are 6/6/5-bit
   counters that wrap 59->0 / 59->0 / 23->0, and a value of 60..63 masks to 0
@@ -133,17 +162,26 @@ Compiling just the source (`-c`) is a fast syntax check.
   `e & 0xFF`, palette = `(e >> 10) & 3`, unused/transparent if `e & 0x300`.
   **Color index 0 of each palette is transparent** (this is what carves out the
   160x144 game window) — it is NOT bit 15 of the color.
-- SGB detection: in SGB modes (`ModeIsSgb`) `reset()` sets `C=0x14` so games
-  enable SGB features; `MLT_REQ` ($11) enables multiplayer and `readJoyp`
-  returns the joypad ID (`$xE` = player 2, etc.) when both P14/P15 are high.
-- CGB+SGB modes (`SYS_GBC_SGB`, `SYS_GBC_INIT_SGB`) run the game in **CGB mode**
-  (`C=0x00`, full color) and do **not** let the game send its own border. Instead
-  `CapturarBordeSgbParaCgb()` runs a throwaway copy of the cart as **DMG+SGB**
-  (local `Bus`, `sgbSignatureMode=1`, up to `kSgbCaptureFrames`=600 frames until
-  `sgbBorderFromPacket`), decodes the border into `g_sgb_captured_border`, and
-  discards the copy. The real CGB session then displays that captured border.
-  Forcing `C=0x14` in CGB mode is **not** viable: Gold/Silver/Crystal hang.
-  This is triggered by `PrepararBordeParaModo()` on ROM load / mode switch.
+- SGB detection: in the border modes (`ModeUsesBorder`) `reset()` sets `C=0x14`
+  so games enable SGB features; `MLT_REQ` ($11) enables multiplayer and
+  `readJoyp` returns the joypad ID (`$xE` = player 2, etc.) when both P14/P15
+  are high.
+- CGB+SGB modes (`SYS_GBC_SGB`, `SYS_GBC_INIT_SGB`) run **CGB carts** in
+  **CGB mode** (`C=0x00`, full color) and do **not** let the game send its own
+  border. Instead `CapturarBordeSgbParaCgb()` runs a throwaway copy of the cart
+  as **DMG+SGB** (local `Bus`, `sgbSignatureMode=1`, up to
+  `kSgbCaptureFrames`=600 frames until `sgbBorderFromPacket`), decodes the
+  border into `g_sgb_captured_border`, and discards the copy. The real CGB
+  session then displays that captured border. Forcing `C=0x14` in CGB mode is
+  **not** viable: Gold/Silver/Crystal hang. This is triggered by
+  `PrepararBordeParaModo()` on ROM load / mode switch.
+- **DMG carts in CGB+SGB modes** run as **DMG+SGB**, not CGB: the CGB flag
+  (`0x143` bit 7) decides, so `ModeForcesCgb` only forces CGB for CGB carts.
+  Forcing CGB on a DMG cart made the PPU read `bgPaletteRam`/`objPaletteRam`,
+  which are initialized to `0x7FFF` (white) and that game never writes (it uses
+  `BGP`/`OBP0`/`OBP1`) -> white screen with sound (Medarot Card Robottle
+  Kuwagata). Such carts now get `C=0x14`, render with the DMG palettes and send
+  their own border, so `PrepararBordeParaModo()` skips the capture for them.
 - Border priority in `InitSgbBorder`: real ROM border (`sgbBorderFromPacket`)
   > captured border (`g_sgb_captured_border`) > external file > fallback style
   (only when `Force SGB Border` is on).
